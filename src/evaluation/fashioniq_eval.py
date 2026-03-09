@@ -2,15 +2,20 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from typing import Optional, Tuple, List, Dict
-import os
-from PIL import Image
+from typing import Optional
 
-from custom_datasets.fashioniq import FashionIQ, build_fashioniq_dataset
-from models import TwoEncoderVLM
-from utils.decorators import timed_metric
-from utils.tensor import make_normalized
-from fusion import fusion
+from src.datasets.fashioniq import FashionIQ, build_fashioniq_dataset
+from src.fusion import fusion
+from src.retrievers.base import TwoEncoderVLM
+from src.utils.decorators import timed_metric
+from src.utils.tensor import make_normalized
+
+
+def _get_module_device(module: torch.nn.Module) -> torch.device:
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
 
 def compute_fashioniq_metrics(
     index_features: torch.Tensor, # (N, D) tensor of index features
@@ -97,9 +102,10 @@ def generate_fashioniq_index_features(
 
     clip_model.eval()
     vision_encoder = clip_model.vision
+    vision_device = _get_module_device(vision_encoder)
 
     for batch in tqdm(dataloader, disable=not use_tqdm, desc="Generating FashionIQ index features"):
-        images = batch['image'].to(vision_encoder.device)
+        images = batch['image'].to(vision_device)
 
         image_features = vision_encoder(images).image_embeds
 
@@ -137,12 +143,14 @@ def generate_fashioniq_triplet_features(
     clip_model.eval()
     text_encoder = clip_model.text
     vision_encoder = clip_model.vision
+    text_device = _get_module_device(text_encoder)
+    vision_device = _get_module_device(vision_encoder)
 
     for batch in tqdm(dataloader, disable=not use_tqdm, desc="Generating FashionIQ triplet features"):
-        reference_images = batch['candidate'].to(vision_encoder.device)
+        reference_images = batch['candidate'].to(vision_device)
         reference_names = batch['candidate_name']
-        relative_captions = batch['transformed_caption'].to(text_encoder.device)
-        attention_masks = batch['attention_mask'].to(text_encoder.device)
+        relative_captions = batch['transformed_caption'].to(text_device)
+        attention_masks = batch['attention_mask'].to(text_device)
 
         if skip_targets:
             target_names = []

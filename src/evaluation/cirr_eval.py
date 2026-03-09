@@ -1,19 +1,25 @@
 import numpy as np
 import torch
 
-from evals import metrics
-from models import TwoEncoderVLM
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from typing import Optional, Tuple
 from torch.utils.data import Dataset
 
-from custom_datasets.cirr import build_cirr_dataset
-from utils.decorators import timed_metric
-from utils.tensor import make_normalized
-from fusion import fusion
+from src.datasets.cirr import build_cirr_dataset
+from src.fusion import fusion
+from src.retrievers.base import TwoEncoderVLM
+from src.utils.decorators import timed_metric
+from src.utils.tensor import make_normalized
 
 DEBUG = False
+
+
+def _get_module_device(module: torch.nn.Module) -> torch.device:
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
 
 def compute_recall(top_k_retrieved, targets_np):
     """
@@ -29,7 +35,8 @@ def compute_names(top_k_retrieved, pair_ids):
     """
     names_dict = {}
     for i, pair_id in enumerate(pair_ids):
-        names_dict[pair_id.item()] = top_k_retrieved[i].tolist()
+        pair_id_value = pair_id.item() if hasattr(pair_id, "item") else pair_id
+        names_dict[pair_id_value] = top_k_retrieved[i].tolist()
     return names_dict
 
 def compute_cirr_metrics(
@@ -177,9 +184,10 @@ def generate_cirr_index_features(
 
     clip_model.eval()
     vision_encoder = clip_model.vision
+    vision_device = _get_module_device(vision_encoder)
 
     for batch in tqdm(dataloader, disable=not use_tqdm, desc="Generating CIRR index features"):
-        images = batch['image'].to(vision_encoder.device)
+        images = batch['image'].to(vision_device)
 
         image_features = vision_encoder(images).image_embeds
 
@@ -287,14 +295,16 @@ def generate_cirr_triplet_features(
     clip_model.eval()
     text_encoder = clip_model.text
     vision_encoder = clip_model.vision
+    text_device = _get_module_device(text_encoder)
+    vision_device = _get_module_device(vision_encoder)
 
     for batch in tqdm(dataloader, disable=not use_tqdm, desc="Generating CIRR triplet features"):
-        reference_images = batch['reference'].to(vision_encoder.device)
+        reference_images = batch['reference'].to(vision_device)
         reference_names = batch['reference_name']
         group_members = batch['group_members']
         pair_ids = batch['pair_id']
-        relative_captions = batch['transformed_caption'].to(text_encoder.device)
-        attention_masks = batch['attention_mask'].to(text_encoder.device)
+        relative_captions = batch['transformed_caption'].to(text_device)
+        attention_masks = batch['attention_mask'].to(text_device)
 
         if skip_targets:
             target_names = []
