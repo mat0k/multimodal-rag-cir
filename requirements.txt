@@ -5,3 +5,7 @@ torch>=2.2
 torchvision>=0.17
 transformers>=4.40
 tqdm>=4.66
+timm>=0.9
+einops>=0.7
+ftfy>=6.2
+regex>=2024.0.0

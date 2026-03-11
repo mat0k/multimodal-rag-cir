@@ -144,10 +144,15 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run zero-shot CIR baselines.")
     parser.add_argument("--model_name_or_path", type=str, required=True, help="Base model name or local path.")
-    parser.add_argument("--retriever_module", type=str, default="src.retrievers.vista_bge", help="Python module containing retriever class.")
+    parser.add_argument("--retriever_module", type=str, default="src.retrievers.vista_retriever", help="Python module containing retriever class.")
     parser.add_argument("--retriever_class", type=str, default="VistaBGERetriever", help="Retriever class name inside retriever module.")
     parser.add_argument("--retriever_init_kwargs", type=str, default="{}", help="Extra retriever kwargs in JSON format.")
-    parser.add_argument("--checkpoint_path", type=str, default="", help="Optional retriever checkpoint path.")
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default="",
+        help="Retriever checkpoint path. Required unless model_weight is provided in --retriever_init_kwargs.",
+    )
     parser.add_argument("--datasets", nargs="+", default=["cirr", "fashioniq"], choices=["cirr", "fashioniq"], help="Datasets to evaluate.")
     parser.add_argument("--skip_submission", nargs="*", default=[], choices=["cirr"], help="Skip test submission generation per dataset.")
     parser.add_argument("--batch_size", type=int, default=64, help="Evaluation batch size.")
