@@ -205,3 +205,30 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ── Project-specific ──────────────────────────────────────────────────────────
+
+# Pre-trained & downloaded model weights (never commit weights to git)
+models/
+!models/.gitkeep
+
+# Training checkpoints from your own runs
+checkpoints/
+!checkpoints/.gitkeep
+
+# Evaluation outputs (metrics CSVs, submission JSONs)
+results/
+!results/.gitkeep
+
+# SLURM job logs
+*.out
+*.err
+logs/
+
+# Data images (large binary files — keep only annotations in git)
+data/cirr/images/
+data/fashioniq/images/
+
+# Local dataset symlinks
+data/cirr
+data/fashioniq
