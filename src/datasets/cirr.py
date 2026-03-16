@@ -91,7 +91,7 @@ class CIRR(Dataset):
                 if self.image_transform is not None:
                     target = self.image_transform(target, return_tensors='pt')['pixel_values'][0]
 
-            #load caption
+            # load caption
             caption = triplet['caption']
             transformed_caption = caption
             if self.caption_transform is not None:
@@ -101,18 +101,25 @@ class CIRR(Dataset):
                     max_length=self.max_length_tokenizer,
                     truncation=True,
                     return_tensors='pt')
-                
+
             # load other info
             pair_id = triplet['pairid']
             group_members = triplet['img_set']['members']
-            
+
+            def get_caption_field(tc, field):
+                # Handle tokenizer outputs such as dict or BatchEncoding.
+                if hasattr(tc, "keys") and field in tc:
+                    return tc[field][0]
+                # fallback: return as-is (string or tensor)
+                return tc
+
             if self.split == 'test1':
-                    return {
+                return {
                     'pair_id': pair_id,
                     'reference_name': reference_name,
                     'reference': reference,
-                    'transformed_caption': transformed_caption["input_ids"][0],
-                    'attention_mask': transformed_caption["attention_mask"][0],
+                    'transformed_caption': get_caption_field(transformed_caption, "input_ids"),
+                    'attention_mask': get_caption_field(transformed_caption, "attention_mask"),
                     'caption': caption,
                     'group_members': group_members
                 }
@@ -123,8 +130,8 @@ class CIRR(Dataset):
                 'reference': reference,
                 'target': target,
                 'target_name': target_name,
-                'transformed_caption': transformed_caption["input_ids"][0],
-                'attention_mask': transformed_caption["attention_mask"][0],
+                'transformed_caption': get_caption_field(transformed_caption, "input_ids"),
+                'attention_mask': get_caption_field(transformed_caption, "attention_mask"),
                 'caption': caption,
                 'group_members': group_members,
             }

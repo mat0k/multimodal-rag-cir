@@ -133,9 +133,10 @@ class FashionIQ(Dataset):
                 candidate = self.image_transform(candidate, return_tensors='pt')['pixel_values'][0]
                 target = self.image_transform(target, return_tensors='pt')['pixel_values'][0]
 
-            #join all captions into one string separated by [SEP] token
+            # join all captions into one string
             captions = " ".join(triplet["captions"])
-                
+            transformed_captions = captions
+
             if self.caption_transform is not None:
                 transformed_captions = self.caption_transform(
                     captions,
@@ -144,14 +145,21 @@ class FashionIQ(Dataset):
                     truncation=True,
                     return_tensors='pt')
 
+            def get_caption_field(tc, field):
+                # Handle tokenizer outputs such as dict or BatchEncoding.
+                if hasattr(tc, "keys") and field in tc:
+                    return tc[field][0]
+                # fallback: return as-is (string or tensor)
+                return tc
+
             return {
                 'class': cls,
                 'candidate': candidate,
                 'candidate_name': triplet["candidate"],
                 'target': target,
                 'target_name': triplet["target"],
-                'transformed_caption': transformed_captions["input_ids"][0],
-                'attention_mask': transformed_captions["attention_mask"][0],
+                'transformed_caption': get_caption_field(transformed_captions, "input_ids"),
+                'attention_mask': get_caption_field(transformed_captions, "attention_mask"),
             }
         elif self.mode == 'images':
             image_name = self.images[cls][local_index]
