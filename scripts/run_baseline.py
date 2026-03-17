@@ -9,7 +9,7 @@ import torch
 from src.evaluation.cirr_eval import evaluate_cirr, generate_cirr_test_submission
 from src.evaluation.fashioniq_eval import evaluate_fashioniq
 from src.retrievers.base import TwoEncoderVLM
-from src.utils.io import prepend_key_to_dict, save_to_csv
+from src.utils.io import prepend_key_to_dict, save_records_to_csv, save_to_csv, save_to_json
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -90,6 +90,110 @@ def test_model(
     return metrics
 
 
+def build_structured_metrics(metrics: dict[str, float]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+
+    for full_metric_name, value in metrics.items():
+        dataset = "unknown"
+        split = "val"
+        metric = full_metric_name
+        protocol = {
+            "split": split,
+            "candidate_pool": "unknown",
+            "gallery_category_specific": False,
+            "gallery_full_corpus": False,
+            "score_type": "dataset_level",
+        }
+
+        if full_metric_name.startswith("fashioniq_"):
+            dataset = "fashioniq"
+            metric = full_metric_name.removeprefix("fashioniq_")
+
+            if metric.startswith(("toptee_recall_at@", "shirt_recall_at@", "dress_recall_at@")):
+                protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
+                protocol["gallery_category_specific"] = True
+                protocol["score_type"] = "dataset_level"
+            elif metric.startswith("avg_recall_at@"):
+                protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
+                protocol["gallery_category_specific"] = True
+                protocol["score_type"] = "macro_average"
+            elif metric == "val_macro_recall_at@5":
+                protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
+                protocol["gallery_category_specific"] = True
+                protocol["score_type"] = "macro_average"
+            elif metric == "latency_seconds":
+                protocol["candidate_pool"] = "category-specific validation galleries"
+                protocol["gallery_category_specific"] = True
+                protocol["score_type"] = "system_latency"
+
+        elif full_metric_name.startswith("cirr_"):
+            dataset = "cirr"
+            metric = full_metric_name.removeprefix("cirr_")
+
+            if metric.startswith("subset_recall_at"):
+                protocol["candidate_pool"] = "query-group subset gallery, reference removed"
+                protocol["score_type"] = "dataset_level"
+            elif metric.startswith("recall_at"):
+                protocol["candidate_pool"] = "full validation gallery, reference removed"
+                protocol["gallery_full_corpus"] = True
+                protocol["score_type"] = "dataset_level"
+            elif metric == "val_global_recall_at5":
+                protocol["candidate_pool"] = "full validation gallery, reference removed"
+                protocol["gallery_full_corpus"] = True
+                protocol["score_type"] = "dataset_level"
+            elif metric == "val_subset_recall_at1":
+                protocol["candidate_pool"] = "query-group subset gallery, reference removed"
+                protocol["score_type"] = "dataset_level"
+            elif metric == "val_summary_average":
+                protocol["candidate_pool"] = "combined global(full-corpus) and subset(query-group) validation metrics"
+                protocol["score_type"] = "macro_average"
+            elif metric == "latency_seconds":
+                protocol["candidate_pool"] = "mixed global and subset validation pipelines"
+                protocol["score_type"] = "system_latency"
+
+        records.append(
+            {
+                "dataset": dataset,
+                "split": split,
+                "metric": metric,
+                "value": value,
+                "protocol": protocol,
+            }
+        )
+
+    return records
+
+
+def build_protocol_validation_summary(datasets: list[str]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "validated": True,
+        "datasets": {},
+    }
+
+    if "fashioniq" in datasets:
+        summary["datasets"]["fashioniq"] = {
+            "split": "val",
+            "candidate_pool": "category-specific gallery (dress/shirt/toptee)",
+            "reference_removed": True,
+            "paper_overall_r5_protocol": "macro average of class-level R@5",
+        }
+
+    if "cirr" in datasets:
+        summary["datasets"]["cirr"] = {
+            "split": "val",
+            "global_candidate_pool": "full validation gallery",
+            "subset_candidate_pool": "query group members",
+            "reference_removed": True,
+            "paper_summary": {
+                "global": "R@5",
+                "subset": "R@1",
+                "optional_average": "(R@5 + subset_R@1)/2",
+            },
+        }
+
+    return summary
+
+
 def main(args: argparse.Namespace) -> None:
     device = resolve_device(args.device)
 
@@ -118,6 +222,17 @@ def main(args: argparse.Namespace) -> None:
         use_tqdm=args.tqdm,
     )
     save_to_csv(metrics, os.path.join(output_path, "metrics.csv"))
+
+    structured_metrics = build_structured_metrics(metrics)
+    save_records_to_csv(
+        structured_metrics,
+        os.path.join(output_path, "metrics_structured.csv"),
+        fieldnames=["dataset", "split", "metric", "value", "protocol"],
+    )
+    save_to_json(structured_metrics, os.path.join(output_path, "metrics_structured.json"))
+
+    protocol_validation = build_protocol_validation_summary(args.datasets)
+    save_to_json(protocol_validation, os.path.join(output_path, "evaluation_protocol.json"))
 
     with open(os.path.join(output_path, "run_config.json"), "w", encoding="utf-8") as file_obj:
         json.dump(vars(args), file_obj, indent=2)

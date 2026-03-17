@@ -25,11 +25,11 @@ def compute_fashioniq_metrics(
     reference_names: list, # list of length M with the names of the reference images for each triplet
     target_names: list, # list of length M with the names of the target images for each triplet
     triplet_classes: list, # list of length M with the classes of the triplets
-    k_values: Optional[list] = [10, 50],
+    k_values: Optional[list] = [5, 10, 50],
 ):
-    """Compute FashionIQ evaluation metrics (R@K and mAP@K) grouped by class for the given index and predicted features. """
+    """Compute FashionIQ recall metrics grouped by class for the given index and predicted features."""
     metrics = {}
-    unique_classes = set(triplet_classes)
+    unique_classes = sorted(set(triplet_classes))
     for cls in unique_classes:
         cls_index_indices = [i for i, c in enumerate(index_classes) if c == cls]
         cls_index_features = index_features[cls_index_indices]
@@ -76,6 +76,10 @@ def compute_fashioniq_metrics(
     for k in k_values:
         avg_recall_at_k = np.mean([metrics[f'{cls}_recall_at@{k}'] for cls in unique_classes] )
         metrics[f'avg_recall_at@{k}'] = avg_recall_at_k
+
+    # Clear summary metric name for validation macro recall@5.
+    if 'avg_recall_at@5' in metrics:
+        metrics['val_macro_recall_at@5'] = metrics['avg_recall_at@5']
 
     return metrics
     
@@ -231,7 +235,7 @@ def evaluate_fashioniq(
         reference_names=reference_names,
         target_names=target_names,
         triplet_classes=triplet_classes,
-        k_values = [10,50],
+        k_values = [5, 10, 50],
     )
 
     return metrics
@@ -292,7 +296,7 @@ def fashioniq_test_alpha(
             reference_names=reference_names,
             target_names=target_names,
             triplet_classes=triplet_classes,
-            k_values = [10,50],
+            k_values = [5, 10, 50],
         )
         alpha_scores[alpha] = metrics
 

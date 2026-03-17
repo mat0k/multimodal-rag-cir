@@ -415,6 +415,15 @@ def evaluate_cirr(
         k_values_subset = [1,2,3],
     )
 
+    if 'recall_at5' in metrics:
+        metrics['val_global_recall_at5'] = metrics['recall_at5']
+    if 'subset_recall_at1' in metrics:
+        metrics['val_subset_recall_at1'] = metrics['subset_recall_at1']
+    if 'val_global_recall_at5' in metrics and 'val_subset_recall_at1' in metrics:
+        metrics['val_summary_average'] = float(
+            np.mean([metrics['val_global_recall_at5'], metrics['val_subset_recall_at1']])
+        )
+
     if return_index_tuple:
         return metrics, (index_features, index_names)
     return metrics
