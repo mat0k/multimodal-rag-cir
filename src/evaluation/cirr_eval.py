@@ -121,44 +121,44 @@ def compute_cirr_metrics(
         elif return_type == 'metrics':
             output[f"recall_at{k}"] = compute_recall(top_k_retrieved, targets_np)
 
+    # Audit global protocol correctness.
+    reference_np = np.array(reference_names).reshape(-1, 1)
+    if np.any(sorted_index_names == reference_np):
+        raise ValueError("CIRR reference-image removal failed: reference still appears in ranking.")
+    if return_type == 'metrics' and not np.all(np.any(sorted_index_names == targets_np, axis=1)):
+        raise ValueError("CIRR target not found in full candidate gallery for one or more queries.")
+
     # ---- compute subset recall@k ------
     if not skip_subset_metrics:
-        #we need to exclude non-group members from the ranking
-        # previous implementation:
+        max_subset_k = max(k_values_subset)
+        subset_candidates: list[np.ndarray] = []
 
-        # length of group members might vary, so we need to build a mask for each query
-        # max_k = max(k_values_subset)
-        # subset_candidates = []
-        # for i, members in enumerate(group_members):
-        #     member_set = set(members)
-        #     mask = np.array([name in member_set for name in sorted_index_names[i]]) #(M-1,)
-        #     subset_candidate_names = sorted_index_names[i][mask]
+        for i, members in enumerate(group_members):
+            member_set = set(members)
+            subset_candidate_names = np.array([name for name in sorted_index_names[i] if name in member_set])
 
-        #     assert len(subset_candidate_names) >= max_k, f"Number of subset candidates ({len(subset_candidate_names)}) is not enough for max_k ({max_k}) for pair_id {pair_ids[i]}"
-        #     subset_candidates.append(subset_candidate_names[:max_k])
+            if len(subset_candidate_names) < max_subset_k:
+                pair_id = pair_ids[i].item() if hasattr(pair_ids[i], "item") else pair_ids[i]
+                raise ValueError(
+                    f"Subset gallery has only {len(subset_candidate_names)} candidates for pair_id={pair_id}; "
+                    f"expected at least {max_subset_k}."
+                )
 
-        # sorted_index_names_subset = np.array(subset_candidates)  # (N, max_k)
+            if return_type == 'metrics' and target_names[i] not in member_set:
+                pair_id = pair_ids[i].item() if hasattr(pair_ids[i], "item") else pair_ids[i]
+                raise ValueError(f"Target for pair_id={pair_id} is missing from CIRR subset member list.")
 
-        # convert group members to numpy array and reshape for broadcasting
-        group_members = np.array(group_members).reshape(len(pair_ids), 1, -1)  # (N, 1, G)
-        # compute mask to select only group members from sorted_index_names
-        subset_mask = np.any(sorted_index_names[:, :, np.newaxis] == group_members, axis=2) # (N, M-1)
-        # apply mask and reshape
-        sorted_index_names_subset = sorted_index_names[subset_mask].reshape(sorted_index_names.shape[0], -1) # (N, G)
-
-        if DEBUG:
-            print(f"sorted_index_names shape: {sorted_index_names.shape}")
-            print(f"pair_ids length: {len(pair_ids)}")
-            print(f"group_members length: {len(group_members)}. Width of first element: {len(group_members[0])}")
-            print(f"sorted_index_names_subset shape: {sorted_index_names_subset.shape}")
-
+            subset_candidates.append(subset_candidate_names)
 
         for k in k_values_subset:
-            top_k_retrieved = sorted_index_names_subset[:, :k]
             if return_type == 'names':
-                output[f"subset_top_{k}"] = compute_names(top_k_retrieved, pair_ids)
+                subset_top_k = np.array([candidates[:k] for candidates in subset_candidates])
+                output[f"subset_top_{k}"] = compute_names(subset_top_k, pair_ids)
             elif return_type == 'metrics':
-                output[f"subset_recall_at{k}"] = compute_recall(top_k_retrieved, targets_np)
+                subset_hits = []
+                for i, candidates in enumerate(subset_candidates):
+                    subset_hits.append(target_names[i] in candidates[:k])
+                output[f"subset_recall_at{k}"] = float(np.mean(subset_hits) * 100.0)
 
     return output
     
@@ -401,7 +401,7 @@ def evaluate_cirr(
         alpha=0.7
     )
 
-    metrics = compute_cirr_metrics(
+    raw_metrics = compute_cirr_metrics(
         index_features=index_features,
         index_names=index_names,
         predicted_features=predicted_features,
@@ -415,13 +415,21 @@ def evaluate_cirr(
         k_values_subset = [1,2,3],
     )
 
-    if 'recall_at5' in metrics:
-        metrics['val_global_recall_at5'] = metrics['recall_at5']
-    if 'subset_recall_at1' in metrics:
-        metrics['val_subset_recall_at1'] = metrics['subset_recall_at1']
-    if 'val_global_recall_at5' in metrics and 'val_subset_recall_at1' in metrics:
-        metrics['val_summary_average'] = float(
-            np.mean([metrics['val_global_recall_at5'], metrics['val_subset_recall_at1']])
+    metrics: dict[str, float] = {}
+
+    for k in [1, 5, 10, 50]:
+        key = f"recall_at{k}"
+        if key in raw_metrics:
+            metrics[f"val_global_recall_at{k}"] = float(raw_metrics[key])
+
+    for k in [1, 2, 3]:
+        key = f"subset_recall_at{k}"
+        if key in raw_metrics:
+            metrics[f"val_subset_recall_at{k}"] = float(raw_metrics[key])
+
+    if "val_global_recall_at5" in metrics and "val_subset_recall_at1" in metrics:
+        metrics["val_summary_average"] = float(
+            np.mean([metrics["val_global_recall_at5"], metrics["val_subset_recall_at1"]])
         )
 
     if return_index_tuple:

@@ -31,21 +31,23 @@ class FashionIQ(Dataset):
         images_path: str,
         annotations_path: str,
         logs_path: str,
-        split: Literal['train', 'val'] = 'val',
+        split: Literal['train', 'val', 'test'] = 'val',
         image_transform: Optional[Callable] = None,
         caption_transform: Optional[Callable] = None,
         max_length_tokenizer: int = 77,
-        mode: Literal['triplets', 'images'] = 'triplets'
+        mode: Literal['triplets', 'images'] = 'triplets',
+        caption_joiner: str = ' '
     ):
         super(FashionIQ, self).__init__()
 
-        assert split in ['train', 'val'], f"split must be one of ['train', 'val'], found {split} instead."
+        assert split in ['train', 'val', 'test'], f"split must be one of ['train', 'val', 'test'], found {split} instead."
 
         self.name = 'FashionIQ'
         self.split = split
         self.image_transform = image_transform
         self.caption_transform = caption_transform
         self.max_length_tokenizer = max_length_tokenizer
+        self.caption_joiner = caption_joiner
 
         self.classes = ['dress', 'shirt', 'toptee']
         self.mode = mode
@@ -74,8 +76,16 @@ class FashionIQ(Dataset):
             # remove missing files from annotations
             for ann in annotations:
                 candidate_path = self.get_image_path(cls, ann['candidate'])
-                target_path = self.get_image_path(cls, ann['target'])
-                if ann['candidate'] not in missing_files and ann['target'] not in missing_files and os.path.exists(candidate_path) and os.path.exists(target_path):
+                has_target = 'target' in ann
+                target_exists = True
+                target_not_missing = True
+
+                if has_target:
+                    target_path = self.get_image_path(cls, ann['target'])
+                    target_exists = os.path.exists(target_path)
+                    target_not_missing = ann['target'] not in missing_files
+
+                if ann['candidate'] not in missing_files and os.path.exists(candidate_path) and target_exists and target_not_missing:
                     self.annotations[cls].append(ann)
             # save all images for the class and split
             img_file = os.path.join(annotations_path, f"split.{cls}.{self.split}.json")
@@ -125,16 +135,21 @@ class FashionIQ(Dataset):
             triplet = self.annotations[cls][local_index]
 
             candidate_path = self.get_image_path(cls, triplet['candidate'])
-            target_path = self.get_image_path(cls, triplet['target'])
             candidate = Image.open(candidate_path).convert('RGB')
-            target = Image.open(target_path).convert('RGB')
+            target_name = triplet.get('target')
+            target = None
+
+            if target_name is not None:
+                target_path = self.get_image_path(cls, target_name)
+                target = Image.open(target_path).convert('RGB')
 
             if self.image_transform is not None:
                 candidate = self.image_transform(candidate, return_tensors='pt')['pixel_values'][0]
-                target = self.image_transform(target, return_tensors='pt')['pixel_values'][0]
+                if target is not None:
+                    target = self.image_transform(target, return_tensors='pt')['pixel_values'][0]
 
             # join all captions into one string
-            captions = " ".join(triplet["captions"])
+            captions = self.caption_joiner.join(triplet["captions"])
             transformed_captions = captions
 
             if self.caption_transform is not None:
@@ -152,15 +167,19 @@ class FashionIQ(Dataset):
                 # fallback: return as-is (string or tensor)
                 return tc
 
-            return {
+            sample = {
                 'class': cls,
                 'candidate': candidate,
                 'candidate_name': triplet["candidate"],
-                'target': target,
-                'target_name': triplet["target"],
+                'target_name': target_name if target_name is not None else "",
                 'transformed_caption': get_caption_field(transformed_captions, "input_ids"),
                 'attention_mask': get_caption_field(transformed_captions, "attention_mask"),
             }
+
+            if target is not None:
+                sample['target'] = target
+
+            return sample
         elif self.mode == 'images':
             image_name = self.images[cls][local_index]
             image_path = self.get_image_path(cls, image_name)
@@ -181,11 +200,12 @@ class FashionIQ(Dataset):
 
 
 def build_fashioniq_dataset(
-    split: Literal['train', 'val'] = 'val',
+    split: Literal['train', 'val', 'test'] = 'val',
     image_transform: Optional[Callable] = None,
     caption_transform: Optional[Callable] = None,
     max_length_tokenizer: int = 77,
     mode: Literal['triplets', 'images'] = 'triplets',  # 'triplets' or 'images',
+    caption_joiner: str = ' ',
 ):
     return FashionIQ(
         images_path="data/fashioniq/images",
@@ -196,4 +216,5 @@ def build_fashioniq_dataset(
         caption_transform=caption_transform,
         max_length_tokenizer=max_length_tokenizer,
         mode=mode,
+        caption_joiner=caption_joiner,
     )

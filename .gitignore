@@ -232,3 +232,6 @@ data/fashioniq/images/
 # Local dataset symlinks
 data/cirr
 data/fashioniq
+
+# Local-only handoff notes for agent sessions
+LOCAL_AGENT_REFERENCE.md

@@ -11,6 +11,30 @@ from src.utils.decorators import timed_metric
 from src.utils.tensor import make_normalized
 
 
+FASHIONIQ_EVAL_PROTOCOLS = {
+    "val_split": {
+        "split": "val",
+        "metric_prefix": "val",
+        "caption_joiner": " ",
+        "candidate_pool": "category-specific validation gallery (dress/shirt/toptee), reference removed",
+    },
+    "original_split": {
+        # True original FashionIQ split uses the official test split annotations and gallery.
+        "split": "test",
+        "metric_prefix": "original",
+        "caption_joiner": " and ",
+        "candidate_pool": "category-specific official test gallery (dress/shirt/toptee), reference removed",
+    },
+}
+
+
+def resolve_fashioniq_eval_protocol(eval_protocol: str) -> dict[str, str]:
+    if eval_protocol not in FASHIONIQ_EVAL_PROTOCOLS:
+        supported = ", ".join(sorted(FASHIONIQ_EVAL_PROTOCOLS.keys()))
+        raise ValueError(f"Unsupported FashionIQ eval protocol '{eval_protocol}'. Supported: {supported}")
+    return FASHIONIQ_EVAL_PROTOCOLS[eval_protocol].copy()
+
+
 def _get_module_device(module: torch.nn.Module) -> torch.device:
     try:
         return next(module.parameters()).device
@@ -26,10 +50,22 @@ def compute_fashioniq_metrics(
     target_names: list, # list of length M with the names of the target images for each triplet
     triplet_classes: list, # list of length M with the classes of the triplets
     k_values: Optional[list] = [5, 10, 50],
+    metric_prefix: str = "val",
 ):
     """Compute FashionIQ recall metrics grouped by class for the given index and predicted features."""
     metrics = {}
+    expected_classes = {"dress", "shirt", "toptee"}
     unique_classes = sorted(set(triplet_classes))
+
+    if len(reference_names) != len(target_names):
+        raise ValueError("FashionIQ evaluation expects one target per query; found mismatch.")
+
+    if not expected_classes.issubset(set(unique_classes)):
+        raise ValueError(
+            "FashionIQ evaluation is expected to contain dress/shirt/toptee queries; "
+            f"found classes: {sorted(set(unique_classes))}"
+        )
+
     for cls in unique_classes:
         cls_index_indices = [i for i, c in enumerate(index_classes) if c == cls]
         cls_index_features = index_features[cls_index_indices]
@@ -39,6 +75,12 @@ def compute_fashioniq_metrics(
         cls_predicted_features = predicted_features[cls_indices]
         cls_reference_names = [reference_names[i] for i in cls_indices]
         cls_target_names = [target_names[i] for i in cls_indices]
+
+        if cls_index_features.shape[0] <= max(k_values):
+            raise ValueError(
+                f"Class '{cls}' gallery has {cls_index_features.shape[0]} items, "
+                f"which is not enough to compute max recall@{max(k_values)}."
+            )
 
         # Compute similarity scores between predicted features and index features
         similarity_scores = torch.matmul(cls_predicted_features, cls_index_features.T)
@@ -64,22 +106,25 @@ def compute_fashioniq_metrics(
         )
 
         targets_np = np.array(cls_target_names).reshape(-1, 1)
+        reference_np = np.array(cls_reference_names).reshape(-1, 1)
+
+        # Audit checks to ensure protocol correctness.
+        if np.any(sorted_index_names == reference_np):
+            raise ValueError(f"Reference removal failed for class '{cls}'.")
+        if not np.all(np.any(sorted_index_names == targets_np, axis=1)):
+            raise ValueError(f"Some targets are not present in class '{cls}' candidate gallery.")
 
         # Compute R@K for each K in k_values
         for k in k_values:
             top_k_names = sorted_index_names[:, :k]
             hits = np.any(top_k_names == targets_np, axis=1)
             recall_at_k = np.mean(hits) * 100
-            metrics[f'{cls}_recall_at@{k}'] = recall_at_k
+            metrics[f"{metric_prefix}_{cls}_recall_at{k}"] = float(recall_at_k)
 
     # compute averages across classes
     for k in k_values:
-        avg_recall_at_k = np.mean([metrics[f'{cls}_recall_at@{k}'] for cls in unique_classes] )
-        metrics[f'avg_recall_at@{k}'] = avg_recall_at_k
-
-    # Clear summary metric name for validation macro recall@5.
-    if 'avg_recall_at@5' in metrics:
-        metrics['val_macro_recall_at@5'] = metrics['avg_recall_at@5']
+        avg_recall_at_k = np.mean([metrics[f"{metric_prefix}_{cls}_recall_at{k}"] for cls in unique_classes])
+        metrics[f"{metric_prefix}_avg_recall_at{k}"] = float(avg_recall_at_k)
 
     return metrics
     
@@ -159,7 +204,11 @@ def generate_fashioniq_triplet_features(
         if skip_targets:
             target_names = []
         else:
-            target_names = batch['target_name']
+            raw_target_names = batch.get('target_name')
+            if raw_target_names is None:
+                target_names = [None] * len(reference_names)
+            else:
+                target_names = [name if name else None for name in raw_target_names]
 
         reference_features = vision_encoder(reference_images).image_embeds
         caption_features = text_encoder(
@@ -185,21 +234,26 @@ def evaluate_fashioniq(
     num_workers: int = 4,
     tqdm : bool = False,
     accelerator=None,
+    eval_protocol: str = "original_split",
 ):
+    protocol_config = resolve_fashioniq_eval_protocol(eval_protocol)
+
     fashioniq_index = build_fashioniq_dataset(
-        split='val',
+        split=protocol_config["split"],
         mode='images',
         image_transform=model.image_processor,
         caption_transform=model.tokenizer,
-        max_length_tokenizer=77
+        max_length_tokenizer=77,
+        caption_joiner=protocol_config["caption_joiner"],
     )
 
     fashioniq_triplets = build_fashioniq_dataset(
-        split='val',
+        split=protocol_config["split"],
         mode='triplets',
         image_transform=model.image_processor,
         caption_transform=model.tokenizer,
-        max_length_tokenizer=77
+        max_length_tokenizer=77,
+        caption_joiner=protocol_config["caption_joiner"],
     )
 
     index_features, index_names, index_classes  = generate_fashioniq_index_features(
@@ -220,6 +274,15 @@ def evaluate_fashioniq(
         accelerator=accelerator
     )
 
+    if any(target_name is None for target_name in target_names):
+        if protocol_config["split"] == "test":
+            # Official test split has no targets; run in submission-style mode.
+            return {}
+        raise ValueError(
+            "FashionIQ evaluation requires target ids for metric computation, but at least one target is missing. "
+            f"Protocol '{eval_protocol}' is configured with split '{protocol_config['split']}'."
+        )
+
     predicted_features = fusion(
         image_features=image_features,
         text_features=text_features,
@@ -236,6 +299,7 @@ def evaluate_fashioniq(
         target_names=target_names,
         triplet_classes=triplet_classes,
         k_values = [5, 10, 50],
+        metric_prefix=protocol_config["metric_prefix"],
     )
 
     return metrics

@@ -58,6 +58,7 @@ def load_retriever(
 def test_model(
     model: TwoEncoderVLM,
     datasets: list[str],
+    fashioniq_eval_protocol: str = "original_split",
     fusion_type: str = "sum",
     batch_size: int = 64,
     num_workers: int = 4,
@@ -68,12 +69,18 @@ def test_model(
     if "fashioniq" in datasets:
         fashioniq_metrics = evaluate_fashioniq(
             model=model,
+            eval_protocol=fashioniq_eval_protocol,
             fusion_type=fusion_type,
             batch_size=batch_size,
             num_workers=num_workers,
             tqdm=use_tqdm,
             accelerator=None,
         )
+
+        fashioniq_prefix = "original" if fashioniq_eval_protocol == "original_split" else "val"
+        if "latency_seconds" in fashioniq_metrics:
+            fashioniq_metrics[f"{fashioniq_prefix}_latency_seconds"] = fashioniq_metrics.pop("latency_seconds")
+
         metrics.update(prepend_key_to_dict("fashioniq_", fashioniq_metrics))
 
     if "cirr" in datasets:
@@ -85,6 +92,10 @@ def test_model(
             tqdm=use_tqdm,
             accelerator=None,
         )
+
+        if "latency_seconds" in cirr_metrics:
+            cirr_metrics["val_latency_seconds"] = cirr_metrics.pop("latency_seconds")
+
         metrics.update(prepend_key_to_dict("cirr_", cirr_metrics))
 
     return metrics
@@ -95,56 +106,65 @@ def build_structured_metrics(metrics: dict[str, float]) -> list[dict[str, Any]]:
 
     for full_metric_name, value in metrics.items():
         dataset = "unknown"
-        split = "val"
+        split = "unknown"
         metric = full_metric_name
         protocol = {
+            "name": "unknown",
             "split": split,
             "candidate_pool": "unknown",
+            "reference_removed": True,
             "gallery_category_specific": False,
             "gallery_full_corpus": False,
+            "text_composition": "unknown",
             "score_type": "dataset_level",
         }
 
-        if full_metric_name.startswith("fashioniq_"):
+        if full_metric_name.startswith("fashioniq_val_"):
             dataset = "fashioniq"
-            metric = full_metric_name.removeprefix("fashioniq_")
+            split = "val"
+            metric = full_metric_name.removeprefix("fashioniq_val_")
+            protocol["name"] = "val_split"
+            protocol["split"] = split
+            protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
+            protocol["gallery_category_specific"] = True
+            protocol["text_composition"] = "caption1 + space + caption2"
 
-            if metric.startswith(("toptee_recall_at@", "shirt_recall_at@", "dress_recall_at@")):
-                protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
-                protocol["gallery_category_specific"] = True
-                protocol["score_type"] = "dataset_level"
-            elif metric.startswith("avg_recall_at@"):
-                protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
-                protocol["gallery_category_specific"] = True
-                protocol["score_type"] = "macro_average"
-            elif metric == "val_macro_recall_at@5":
-                protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
-                protocol["gallery_category_specific"] = True
+            if metric.endswith("avg_recall_at5") or metric.endswith("avg_recall_at10") or metric.endswith("avg_recall_at50"):
                 protocol["score_type"] = "macro_average"
             elif metric == "latency_seconds":
-                protocol["candidate_pool"] = "category-specific validation galleries"
-                protocol["gallery_category_specific"] = True
                 protocol["score_type"] = "system_latency"
 
-        elif full_metric_name.startswith("cirr_"):
+        elif full_metric_name.startswith("fashioniq_original_"):
+            dataset = "fashioniq"
+            split = "test"
+            metric = full_metric_name.removeprefix("fashioniq_original_")
+            protocol["name"] = "original_split"
+            protocol["split"] = split
+            protocol["candidate_pool"] = "category-specific official test gallery (dress/shirt/toptee), reference removed"
+            protocol["gallery_category_specific"] = True
+            protocol["text_composition"] = "caption1 + ' and ' + caption2"
+
+            if metric.endswith("avg_recall_at5") or metric.endswith("avg_recall_at10") or metric.endswith("avg_recall_at50"):
+                protocol["score_type"] = "macro_average"
+            elif metric == "latency_seconds":
+                protocol["score_type"] = "system_latency"
+
+        elif full_metric_name.startswith("cirr_val_"):
             dataset = "cirr"
-            metric = full_metric_name.removeprefix("cirr_")
+            split = "val"
+            metric = full_metric_name.removeprefix("cirr_val_")
+            protocol["name"] = "benchmark_val"
+            protocol["split"] = split
+            protocol["text_composition"] = "single-caption"
 
             if metric.startswith("subset_recall_at"):
                 protocol["candidate_pool"] = "query-group subset gallery, reference removed"
                 protocol["score_type"] = "dataset_level"
-            elif metric.startswith("recall_at"):
+            elif metric.startswith("global_recall_at"):
                 protocol["candidate_pool"] = "full validation gallery, reference removed"
                 protocol["gallery_full_corpus"] = True
                 protocol["score_type"] = "dataset_level"
-            elif metric == "val_global_recall_at5":
-                protocol["candidate_pool"] = "full validation gallery, reference removed"
-                protocol["gallery_full_corpus"] = True
-                protocol["score_type"] = "dataset_level"
-            elif metric == "val_subset_recall_at1":
-                protocol["candidate_pool"] = "query-group subset gallery, reference removed"
-                protocol["score_type"] = "dataset_level"
-            elif metric == "val_summary_average":
+            elif metric == "summary_average":
                 protocol["candidate_pool"] = "combined global(full-corpus) and subset(query-group) validation metrics"
                 protocol["score_type"] = "macro_average"
             elif metric == "latency_seconds":
@@ -172,10 +192,20 @@ def build_protocol_validation_summary(datasets: list[str]) -> dict[str, Any]:
 
     if "fashioniq" in datasets:
         summary["datasets"]["fashioniq"] = {
-            "split": "val",
-            "candidate_pool": "category-specific gallery (dress/shirt/toptee)",
-            "reference_removed": True,
-            "paper_overall_r5_protocol": "macro average of class-level R@5",
+            "supported_protocols": {
+                "val_split": {
+                    "split": "val",
+                    "candidate_pool": "category-specific gallery (dress/shirt/toptee)",
+                    "reference_removed": True,
+                    "text_composition": "caption1 + space + caption2",
+                },
+                "original_split": {
+                    "split": "test",
+                    "candidate_pool": "category-specific official test gallery (dress/shirt/toptee)",
+                    "reference_removed": True,
+                    "text_composition": "caption1 + ' and ' + caption2",
+                },
+            },
         }
 
     if "cirr" in datasets:
@@ -184,10 +214,10 @@ def build_protocol_validation_summary(datasets: list[str]) -> dict[str, Any]:
             "global_candidate_pool": "full validation gallery",
             "subset_candidate_pool": "query group members",
             "reference_removed": True,
-            "paper_summary": {
-                "global": "R@5",
-                "subset": "R@1",
-                "optional_average": "(R@5 + subset_R@1)/2",
+            "benchmark_metrics": {
+                "global": ["R@1", "R@5", "R@10", "R@50"],
+                "subset": ["R@1", "R@2", "R@3"],
+                "summary": "(global R@5 + subset R@1)/2",
             },
         }
 
@@ -216,6 +246,7 @@ def main(args: argparse.Namespace) -> None:
     metrics = test_model(
         model=model,
         datasets=args.datasets,
+        fashioniq_eval_protocol=args.fashioniq_eval_protocol,
         fusion_type=args.fusion_type,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -270,6 +301,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--datasets", nargs="+", default=["cirr", "fashioniq"], choices=["cirr", "fashioniq"], help="Datasets to evaluate.")
     parser.add_argument("--skip_submission", nargs="*", default=[], choices=["cirr"], help="Skip test submission generation per dataset.")
+    parser.add_argument(
+        "--fashioniq_eval_protocol",
+        type=str,
+        default="original_split",
+        choices=["val_split", "original_split"],
+        help="FashionIQ evaluation protocol: val_split (internal baseline) or original_split (benchmark-comparable).",
+    )
     parser.add_argument("--batch_size", type=int, default=64, help="Evaluation batch size.")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers.")
     parser.add_argument("--fusion_type", type=str, default="sum", help="Image-text feature fusion strategy.")
