@@ -35,6 +35,7 @@ MANIFEST
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
+*.out
 
 # Unit test / coverage reports
 htmlcov/
@@ -205,3 +206,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local/project-specific artifacts
+LOCAL_AGENT_REFERENCE.md
+/results/
+
+
+/res
+
+/models/
+/data/
