@@ -3,7 +3,7 @@ import torch
 
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 from torch.utils.data import Dataset
 
 from src.datasets.cirr import build_cirr_dataset
@@ -13,6 +13,7 @@ from src.utils.decorators import timed_metric
 from src.utils.tensor import make_normalized
 
 DEBUG = False
+QUERY_EMBEDDING_MODES = {"legacy_fusion", "vista_mm"}
 
 
 def _get_module_device(module: torch.nn.Module) -> torch.device:
@@ -20,6 +21,50 @@ def _get_module_device(module: torch.nn.Module) -> torch.device:
         return next(module.parameters()).device
     except StopIteration:
         return torch.device("cpu")
+
+
+def _resolve_query_embedding_mode(query_embedding_mode: str) -> str:
+    if query_embedding_mode not in QUERY_EMBEDDING_MODES:
+        supported = ", ".join(sorted(QUERY_EMBEDDING_MODES))
+        raise ValueError(
+            f"Unsupported query_embedding_mode '{query_embedding_mode}'. Supported: {supported}"
+        )
+    return query_embedding_mode
+
+
+def _get_mm_device(model: TwoEncoderVLM) -> torch.device:
+    backbone = getattr(model, "backbone", None)
+    if isinstance(backbone, torch.nn.Module):
+        return _get_module_device(backbone)
+    return _get_module_device(model.vision)
+
+
+def _encode_mm_query(
+    model: TwoEncoderVLM,
+    images: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    if hasattr(model, "encode_query_mm"):
+        query_features = model.encode_query_mm(
+            pixel_values=images,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        return make_normalized(query_features)
+
+    backbone = getattr(model, "backbone", None)
+    if backbone is not None and hasattr(backbone, "encode_mm"):
+        tokenized = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        return make_normalized(backbone.encode_mm(images, tokenized))
+
+    raise ValueError(
+        "query_embedding_mode='vista_mm' requires either model.encode_query_mm(...) "
+        "or model.backbone.encode_mm(...)."
+    )
 
 def compute_recall(top_k_retrieved, targets_np):
     """
@@ -121,44 +166,44 @@ def compute_cirr_metrics(
         elif return_type == 'metrics':
             output[f"recall_at{k}"] = compute_recall(top_k_retrieved, targets_np)
 
+    # Audit global protocol correctness.
+    reference_np = np.array(reference_names).reshape(-1, 1)
+    if np.any(sorted_index_names == reference_np):
+        raise ValueError("CIRR reference-image removal failed: reference still appears in ranking.")
+    if return_type == 'metrics' and not np.all(np.any(sorted_index_names == targets_np, axis=1)):
+        raise ValueError("CIRR target not found in full candidate gallery for one or more queries.")
+
     # ---- compute subset recall@k ------
     if not skip_subset_metrics:
-        #we need to exclude non-group members from the ranking
-        # previous implementation:
+        max_subset_k = max(k_values_subset)
+        subset_candidates: list[np.ndarray] = []
 
-        # length of group members might vary, so we need to build a mask for each query
-        # max_k = max(k_values_subset)
-        # subset_candidates = []
-        # for i, members in enumerate(group_members):
-        #     member_set = set(members)
-        #     mask = np.array([name in member_set for name in sorted_index_names[i]]) #(M-1,)
-        #     subset_candidate_names = sorted_index_names[i][mask]
+        for i, members in enumerate(group_members):
+            member_set = set(members)
+            subset_candidate_names = np.array([name for name in sorted_index_names[i] if name in member_set])
 
-        #     assert len(subset_candidate_names) >= max_k, f"Number of subset candidates ({len(subset_candidate_names)}) is not enough for max_k ({max_k}) for pair_id {pair_ids[i]}"
-        #     subset_candidates.append(subset_candidate_names[:max_k])
+            if len(subset_candidate_names) < max_subset_k:
+                pair_id = pair_ids[i].item() if hasattr(pair_ids[i], "item") else pair_ids[i]
+                raise ValueError(
+                    f"Subset gallery has only {len(subset_candidate_names)} candidates for pair_id={pair_id}; "
+                    f"expected at least {max_subset_k}."
+                )
 
-        # sorted_index_names_subset = np.array(subset_candidates)  # (N, max_k)
+            if return_type == 'metrics' and target_names[i] not in member_set:
+                pair_id = pair_ids[i].item() if hasattr(pair_ids[i], "item") else pair_ids[i]
+                raise ValueError(f"Target for pair_id={pair_id} is missing from CIRR subset member list.")
 
-        # convert group members to numpy array and reshape for broadcasting
-        group_members = np.array(group_members).reshape(len(pair_ids), 1, -1)  # (N, 1, G)
-        # compute mask to select only group members from sorted_index_names
-        subset_mask = np.any(sorted_index_names[:, :, np.newaxis] == group_members, axis=2) # (N, M-1)
-        # apply mask and reshape
-        sorted_index_names_subset = sorted_index_names[subset_mask].reshape(sorted_index_names.shape[0], -1) # (N, G)
-
-        if DEBUG:
-            print(f"sorted_index_names shape: {sorted_index_names.shape}")
-            print(f"pair_ids length: {len(pair_ids)}")
-            print(f"group_members length: {len(group_members)}. Width of first element: {len(group_members[0])}")
-            print(f"sorted_index_names_subset shape: {sorted_index_names_subset.shape}")
-
+            subset_candidates.append(subset_candidate_names)
 
         for k in k_values_subset:
-            top_k_retrieved = sorted_index_names_subset[:, :k]
             if return_type == 'names':
-                output[f"subset_top_{k}"] = compute_names(top_k_retrieved, pair_ids)
+                subset_top_k = np.array([candidates[:k] for candidates in subset_candidates])
+                output[f"subset_top_{k}"] = compute_names(subset_top_k, pair_ids)
             elif return_type == 'metrics':
-                output[f"subset_recall_at{k}"] = compute_recall(top_k_retrieved, targets_np)
+                subset_hits = []
+                for i, candidates in enumerate(subset_candidates):
+                    subset_hits.append(target_names[i] in candidates[:k])
+                output[f"subset_recall_at{k}"] = float(np.mean(subset_hits) * 100.0)
 
     return output
     
@@ -335,9 +380,117 @@ def generate_cirr_triplet_features(
     all_text_features = torch.vstack(all_text_features)
     return all_image_features, all_text_features, all_reference_names, all_target_names, all_group_members, all_pair_ids
 
+
+@torch.no_grad()
+def generate_cirr_mm_query_features(
+    clip_model: TwoEncoderVLM,
+    triplet_dataset: Dataset,
+    batch_size: int = 64,
+    num_workers: int = 4,
+    use_tqdm: bool = False,
+    accelerator=None,
+    skip_targets: bool = False,
+):
+    dataloader = DataLoader(
+        triplet_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    all_predicted_features = []
+    all_reference_names = []
+    all_target_names = []
+    all_group_members = []
+    all_pair_ids = []
+
+    clip_model.eval()
+    mm_device = _get_mm_device(clip_model)
+
+    for batch in tqdm(dataloader, disable=not use_tqdm, desc="Generating CIRR multimodal query features"):
+        reference_images = batch['reference'].to(mm_device)
+        reference_names = batch['reference_name']
+        group_members = batch['group_members']
+        pair_ids = batch['pair_id']
+        relative_captions = batch['transformed_caption'].to(mm_device)
+        attention_masks = batch['attention_mask'].to(mm_device)
+
+        if skip_targets:
+            target_names = []
+        else:
+            target_names = batch['target_name']
+
+        group_members_reshaped = []
+        for i in range(len(group_members[0])):
+            group_members_reshaped.append([group_members[j][i] for j in range(len(group_members))])
+
+        predicted_features = _encode_mm_query(
+            model=clip_model,
+            images=reference_images,
+            input_ids=relative_captions,
+            attention_mask=attention_masks,
+        )
+
+        all_predicted_features.append(predicted_features)
+        all_reference_names.extend(reference_names)
+        all_target_names.extend(target_names)
+        all_group_members.extend(group_members_reshaped)
+        all_pair_ids.extend(pair_ids)
+
+    all_predictions = torch.vstack(all_predicted_features)
+    return all_predictions, all_reference_names, all_target_names, all_group_members, all_pair_ids
+
+
+@torch.no_grad()
+def generate_cirr_predicted_features(
+    clip_model: TwoEncoderVLM,
+    triplet_dataset: Dataset,
+    query_embedding_mode: Literal["legacy_fusion", "vista_mm"] = "vista_mm",
+    fusion_type: str = "sum",
+    batch_size: int = 64,
+    num_workers: int = 4,
+    use_tqdm: bool = False,
+    accelerator=None,
+    skip_targets: bool = False,
+):
+    resolved_mode = _resolve_query_embedding_mode(query_embedding_mode)
+
+    if resolved_mode == "vista_mm":
+        return generate_cirr_mm_query_features(
+            clip_model=clip_model,
+            triplet_dataset=triplet_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            use_tqdm=use_tqdm,
+            accelerator=accelerator,
+            skip_targets=skip_targets,
+        )
+
+    image_features, text_features, reference_names, target_names, group_members, pair_ids = generate_cirr_triplet_features(
+        clip_model=clip_model,
+        triplet_dataset=triplet_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        use_tqdm=use_tqdm,
+        accelerator=accelerator,
+        skip_targets=skip_targets,
+    )
+
+    predicted_features = fusion(
+        image_features=image_features,
+        text_features=text_features,
+        fusion_type=fusion_type,
+        alpha=0.7,
+    )
+    predicted_features = make_normalized(predicted_features)
+
+    return predicted_features, reference_names, target_names, group_members, pair_ids
+
 @timed_metric
 def evaluate_cirr(
     model: TwoEncoderVLM,
+    query_embedding_mode: Literal["legacy_fusion", "vista_mm"] = "vista_mm",
     fusion_type: str = 'sum',
     batch_size: int = 64,
     num_workers: int = 4,
@@ -386,22 +539,18 @@ def evaluate_cirr(
     #     accelerator=accelerator
     # )
 
-    image_features, text_features, reference_names, target_names, group_members, pair_ids = generate_cirr_triplet_features(
+    predicted_features, reference_names, target_names, group_members, pair_ids = generate_cirr_predicted_features(
         clip_model=model,
         triplet_dataset=cirr_triplets,
+        query_embedding_mode=query_embedding_mode,
+        fusion_type=fusion_type,
         batch_size=batch_size,
         num_workers=num_workers,
         use_tqdm=tqdm,
+        accelerator=accelerator,
     )
 
-    predicted_features = fusion(
-        image_features=image_features,
-        text_features=text_features,
-        fusion_type=fusion_type,
-        alpha=0.7
-    )
-
-    metrics = compute_cirr_metrics(
+    raw_metrics = compute_cirr_metrics(
         index_features=index_features,
         index_names=index_names,
         predicted_features=predicted_features,
@@ -415,6 +564,23 @@ def evaluate_cirr(
         k_values_subset = [1,2,3],
     )
 
+    metrics: dict[str, float] = {}
+
+    for k in [1, 5, 10, 50]:
+        key = f"recall_at{k}"
+        if key in raw_metrics:
+            metrics[f"val_global_recall_at{k}"] = float(raw_metrics[key])
+
+    for k in [1, 2, 3]:
+        key = f"subset_recall_at{k}"
+        if key in raw_metrics:
+            metrics[f"val_subset_recall_at{k}"] = float(raw_metrics[key])
+
+    if "val_global_recall_at5" in metrics and "val_subset_recall_at1" in metrics:
+        metrics["val_summary_average"] = float(
+            np.mean([metrics["val_global_recall_at5"], metrics["val_subset_recall_at1"]])
+        )
+
     if return_index_tuple:
         return metrics, (index_features, index_names)
     return metrics
@@ -422,6 +588,7 @@ def evaluate_cirr(
 
 def generate_cirr_test_submission(
     model: TwoEncoderVLM,
+    query_embedding_mode: Literal["legacy_fusion", "vista_mm"] = "vista_mm",
     fusion_type: str = 'sum',
     batch_size: int = 64,
     num_workers: int = 4,
@@ -474,20 +641,16 @@ def generate_cirr_test_submission(
     #     skip_targets=True
     # )
 
-    image_features, text_features, reference_names, target_names, group_members, pair_ids = generate_cirr_triplet_features(
+    predicted_features, reference_names, target_names, group_members, pair_ids = generate_cirr_predicted_features(
         clip_model=model,
         triplet_dataset=cirr_triplets,
+        query_embedding_mode=query_embedding_mode,
+        fusion_type=fusion_type,
         batch_size=batch_size,
         num_workers=num_workers,
         use_tqdm=tqdm,
+        accelerator=accelerator,
         skip_targets=True
-    )
-
-    predicted_features = fusion(
-        image_features=image_features,
-        text_features=text_features,
-        fusion_type=fusion_type,
-        alpha=0.7
     )
 
     submission = compute_cirr_metrics(

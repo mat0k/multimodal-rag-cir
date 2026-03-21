@@ -1,7 +1,10 @@
 import argparse
+from datetime import datetime, timezone
 import importlib
 import json
 import os
+import platform
+import sys
 from typing import Any
 
 import torch
@@ -9,7 +12,7 @@ import torch
 from src.evaluation.cirr_eval import evaluate_cirr, generate_cirr_test_submission
 from src.evaluation.fashioniq_eval import evaluate_fashioniq
 from src.retrievers.base import TwoEncoderVLM
-from src.utils.io import prepend_key_to_dict, save_to_csv
+from src.utils.io import prepend_key_to_dict, save_records_to_csv, save_to_csv, save_to_json
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -58,6 +61,8 @@ def load_retriever(
 def test_model(
     model: TwoEncoderVLM,
     datasets: list[str],
+    query_embedding_mode: str = "vista_mm",
+    fashioniq_eval_protocol: str = "val_split",
     fusion_type: str = "sum",
     batch_size: int = 64,
     num_workers: int = 4,
@@ -68,30 +73,243 @@ def test_model(
     if "fashioniq" in datasets:
         fashioniq_metrics = evaluate_fashioniq(
             model=model,
+            query_embedding_mode=query_embedding_mode,
+            eval_protocol=fashioniq_eval_protocol,
             fusion_type=fusion_type,
             batch_size=batch_size,
             num_workers=num_workers,
             tqdm=use_tqdm,
             accelerator=None,
         )
+
+        fashioniq_prefix = "original" if fashioniq_eval_protocol == "original_split" else "val"
+        if "latency_seconds" in fashioniq_metrics:
+            fashioniq_metrics[f"{fashioniq_prefix}_latency_seconds"] = fashioniq_metrics.pop("latency_seconds")
+
         metrics.update(prepend_key_to_dict("fashioniq_", fashioniq_metrics))
 
     if "cirr" in datasets:
         cirr_metrics = evaluate_cirr(
             model=model,
+            query_embedding_mode=query_embedding_mode,
             fusion_type=fusion_type,
             batch_size=batch_size,
             num_workers=num_workers,
             tqdm=use_tqdm,
             accelerator=None,
         )
+
+        if "latency_seconds" in cirr_metrics:
+            cirr_metrics["val_latency_seconds"] = cirr_metrics.pop("latency_seconds")
+
         metrics.update(prepend_key_to_dict("cirr_", cirr_metrics))
 
     return metrics
 
 
+def build_runtime_context(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
+    requested_device = args.device
+    resolved_device = str(device)
+
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_device_count = int(torch.cuda.device_count()) if cuda_available else 0
+    cuda_device_index: int | None = None
+    cuda_device_name: str | None = None
+
+    if device.type == "cuda" and cuda_available:
+        cuda_device_index = device.index if device.index is not None else int(torch.cuda.current_device())
+        cuda_device_name = str(torch.cuda.get_device_name(cuda_device_index))
+
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "runtime": {
+            "python_version": sys.version.split()[0],
+            "platform": platform.platform(),
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+            "cudnn_version": torch.backends.cudnn.version(),
+        },
+        "device": {
+            "requested": requested_device,
+            "resolved": resolved_device,
+            "type": device.type,
+            "cuda_available": cuda_available,
+            "cuda_device_count": cuda_device_count,
+            "cuda_device_index": cuda_device_index,
+            "cuda_device_name": cuda_device_name,
+        },
+        "evaluation": {
+            "datasets": list(args.datasets),
+            "batch_size": int(args.batch_size),
+            "num_workers": int(args.num_workers),
+            "tqdm": bool(args.tqdm),
+            "query_embedding_mode": args.query_embedding_mode,
+            "fusion_type": args.fusion_type,
+            "fashioniq_eval_protocol": args.fashioniq_eval_protocol,
+            "skip_submission": list(args.skip_submission),
+            "dataloader_pin_memory": True,
+        },
+        "retriever": {
+            "module": args.retriever_module,
+            "class": args.retriever_class,
+            "model_name_or_path": args.model_name_or_path,
+            "checkpoint_path": args.checkpoint_path,
+        },
+    }
+
+
+def build_structured_metrics(
+    metrics: dict[str, float],
+    query_embedding_mode: str,
+    runtime_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+
+    runtime_summary = {
+        "device": runtime_context["device"]["resolved"],
+        "gpu_name": runtime_context["device"]["cuda_device_name"],
+        "batch_size": runtime_context["evaluation"]["batch_size"],
+        "num_workers": runtime_context["evaluation"]["num_workers"],
+        "tqdm": runtime_context["evaluation"]["tqdm"],
+    }
+
+    for full_metric_name, value in metrics.items():
+        dataset = "unknown"
+        split = "unknown"
+        metric = full_metric_name
+        protocol = {
+            "name": "unknown",
+            "split": split,
+            "candidate_pool": "unknown",
+            "reference_removed": True,
+            "gallery_category_specific": False,
+            "gallery_full_corpus": False,
+            "text_composition": "unknown",
+            "query_embedding_mode": query_embedding_mode,
+            "runtime": runtime_summary,
+            "score_type": "dataset_level",
+        }
+
+        if full_metric_name.startswith("fashioniq_val_"):
+            dataset = "fashioniq"
+            split = "val"
+            metric = full_metric_name.removeprefix("fashioniq_val_")
+            protocol["name"] = "val_split"
+            protocol["split"] = split
+            protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
+            protocol["gallery_category_specific"] = True
+            protocol["text_composition"] = "caption1 + space + caption2"
+
+            if metric.endswith("avg_recall_at5") or metric.endswith("avg_recall_at10") or metric.endswith("avg_recall_at50"):
+                protocol["score_type"] = "macro_average"
+            elif metric == "latency_seconds":
+                protocol["score_type"] = "system_latency"
+
+        elif full_metric_name.startswith("fashioniq_original_"):
+            dataset = "fashioniq"
+            split = "test"
+            metric = full_metric_name.removeprefix("fashioniq_original_")
+            protocol["name"] = "original_split"
+            protocol["split"] = split
+            protocol["candidate_pool"] = "category-specific official test gallery (dress/shirt/toptee), reference removed"
+            protocol["gallery_category_specific"] = True
+            protocol["text_composition"] = "caption1 + ' and ' + caption2"
+
+            if metric.endswith("avg_recall_at5") or metric.endswith("avg_recall_at10") or metric.endswith("avg_recall_at50"):
+                protocol["score_type"] = "macro_average"
+            elif metric == "latency_seconds":
+                protocol["score_type"] = "system_latency"
+
+        elif full_metric_name.startswith("cirr_val_"):
+            dataset = "cirr"
+            split = "val"
+            metric = full_metric_name.removeprefix("cirr_val_")
+            protocol["name"] = "benchmark_val"
+            protocol["split"] = split
+            protocol["text_composition"] = "single-caption"
+
+            if metric.startswith("subset_recall_at"):
+                protocol["candidate_pool"] = "query-group subset gallery, reference removed"
+                protocol["score_type"] = "dataset_level"
+            elif metric.startswith("global_recall_at"):
+                protocol["candidate_pool"] = "full validation gallery, reference removed"
+                protocol["gallery_full_corpus"] = True
+                protocol["score_type"] = "dataset_level"
+            elif metric == "summary_average":
+                protocol["candidate_pool"] = "combined global(full-corpus) and subset(query-group) validation metrics"
+                protocol["score_type"] = "macro_average"
+            elif metric == "latency_seconds":
+                protocol["candidate_pool"] = "mixed global and subset validation pipelines"
+                protocol["score_type"] = "system_latency"
+
+        records.append(
+            {
+                "dataset": dataset,
+                "split": split,
+                "metric": metric,
+                "value": value,
+                "protocol": protocol,
+            }
+        )
+
+    return records
+
+
+def build_protocol_validation_summary(
+    datasets: list[str],
+    query_embedding_mode: str,
+    runtime_context: dict[str, Any],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "validated": True,
+        "query_embedding_mode": query_embedding_mode,
+        "runtime": runtime_context,
+        "query_embedding_modes": {
+            "default": "vista_mm",
+            "supported": ["vista_mm", "legacy_fusion"],
+            "vista_mm": "native VISTA multimodal query encoding (encode_mm)",
+            "legacy_fusion": "separate vision/text encoders + manual fusion",
+        },
+        "datasets": {},
+    }
+
+    if "fashioniq" in datasets:
+        summary["datasets"]["fashioniq"] = {
+            "supported_protocols": {
+                "val_split": {
+                    "split": "val",
+                    "candidate_pool": "category-specific gallery (dress/shirt/toptee)",
+                    "reference_removed": True,
+                    "text_composition": "caption1 + space + caption2",
+                },
+                "original_split": {
+                    "split": "test",
+                    "candidate_pool": "category-specific official test gallery (dress/shirt/toptee)",
+                    "reference_removed": True,
+                    "text_composition": "caption1 + ' and ' + caption2",
+                },
+            },
+        }
+
+    if "cirr" in datasets:
+        summary["datasets"]["cirr"] = {
+            "split": "val",
+            "global_candidate_pool": "full validation gallery",
+            "subset_candidate_pool": "query group members",
+            "reference_removed": True,
+            "benchmark_metrics": {
+                "global": ["R@1", "R@5", "R@10", "R@50"],
+                "subset": ["R@1", "R@2", "R@3"],
+                "summary": "(global R@5 + subset R@1)/2",
+            },
+        }
+
+    return summary
+
+
 def main(args: argparse.Namespace) -> None:
     device = resolve_device(args.device)
+    runtime_context = build_runtime_context(args=args, device=device)
 
     init_kwargs: dict[str, Any] = json.loads(args.retriever_init_kwargs)
     if args.checkpoint_path:
@@ -112,6 +330,8 @@ def main(args: argparse.Namespace) -> None:
     metrics = test_model(
         model=model,
         datasets=args.datasets,
+        query_embedding_mode=args.query_embedding_mode,
+        fashioniq_eval_protocol=args.fashioniq_eval_protocol,
         fusion_type=args.fusion_type,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -119,12 +339,36 @@ def main(args: argparse.Namespace) -> None:
     )
     save_to_csv(metrics, os.path.join(output_path, "metrics.csv"))
 
+    structured_metrics = build_structured_metrics(
+        metrics,
+        query_embedding_mode=args.query_embedding_mode,
+        runtime_context=runtime_context,
+    )
+    save_records_to_csv(
+        structured_metrics,
+        os.path.join(output_path, "metrics_structured.csv"),
+        fieldnames=["dataset", "split", "metric", "value", "protocol"],
+    )
+    save_to_json(structured_metrics, os.path.join(output_path, "metrics_structured.json"))
+    save_to_json(runtime_context, os.path.join(output_path, "evaluation_runtime.json"))
+
+    protocol_validation = build_protocol_validation_summary(
+        args.datasets,
+        query_embedding_mode=args.query_embedding_mode,
+        runtime_context=runtime_context,
+    )
+    save_to_json(protocol_validation, os.path.join(output_path, "evaluation_protocol.json"))
+
+    run_config = vars(args).copy()
+    run_config["resolved_device"] = str(device)
+    run_config["runtime_metadata_file"] = "evaluation_runtime.json"
     with open(os.path.join(output_path, "run_config.json"), "w", encoding="utf-8") as file_obj:
-        json.dump(vars(args), file_obj, indent=2)
+        json.dump(run_config, file_obj, indent=2)
 
     if "cirr" in args.datasets and "cirr" not in args.skip_submission:
         cirr_test_sub = generate_cirr_test_submission(
             model=model,
+            query_embedding_mode=args.query_embedding_mode,
             fusion_type=args.fusion_type,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -155,9 +399,28 @@ if __name__ == "__main__":
     )
     parser.add_argument("--datasets", nargs="+", default=["cirr", "fashioniq"], choices=["cirr", "fashioniq"], help="Datasets to evaluate.")
     parser.add_argument("--skip_submission", nargs="*", default=[], choices=["cirr"], help="Skip test submission generation per dataset.")
+    parser.add_argument(
+        "--fashioniq_eval_protocol",
+        type=str,
+        default="val_split",
+        choices=["val_split", "original_split"],
+        help="FashionIQ evaluation protocol: val_split (internal baseline) or original_split (benchmark-comparable).",
+    )
     parser.add_argument("--batch_size", type=int, default=64, help="Evaluation batch size.")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers.")
-    parser.add_argument("--fusion_type", type=str, default="sum", help="Image-text feature fusion strategy.")
+    parser.add_argument(
+        "--query_embedding_mode",
+        type=str,
+        default="vista_mm",
+        choices=["vista_mm", "legacy_fusion"],
+        help="Query embedding path: vista_mm (native multimodal encoding) or legacy_fusion (manual image-text fusion).",
+    )
+    parser.add_argument(
+        "--fusion_type",
+        type=str,
+        default="sum",
+        help="Image-text fusion strategy used only when --query_embedding_mode=legacy_fusion.",
+    )
     parser.add_argument("--device", type=str, default="auto", help="Device: auto, cpu, cuda, cuda:0, etc.")
     parser.add_argument("--tqdm", action="store_true", help="Enable progress bars.")
     parser.add_argument("--output_path", type=str, default="results", help="Directory where outputs are saved.")
