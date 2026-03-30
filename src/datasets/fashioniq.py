@@ -36,7 +36,8 @@ class FashionIQ(Dataset):
         caption_transform: Optional[Callable] = None,
         max_length_tokenizer: int = 77,
         mode: Literal['triplets', 'images'] = 'triplets',
-        caption_joiner: str = ' '
+        caption_joiner: str = ' ',
+        reverse_caption_order: bool = False,
     ):
         super(FashionIQ, self).__init__()
 
@@ -48,6 +49,7 @@ class FashionIQ(Dataset):
         self.caption_transform = caption_transform
         self.max_length_tokenizer = max_length_tokenizer
         self.caption_joiner = caption_joiner
+        self.reverse_caption_order = reverse_caption_order
 
         self.classes = ['dress', 'shirt', 'toptee']
         self.mode = mode
@@ -149,7 +151,11 @@ class FashionIQ(Dataset):
                     target = self.image_transform(target, return_tensors='pt')['pixel_values'][0]
 
             # join all captions into one string
-            captions = self.caption_joiner.join(triplet["captions"])
+            captions_list = list(triplet["captions"])
+            if self.reverse_caption_order:
+                captions_list = list(reversed(captions_list))
+
+            captions = self.caption_joiner.join(captions_list)
             transformed_captions = captions
 
             if self.caption_transform is not None:
@@ -206,6 +212,7 @@ def build_fashioniq_dataset(
     max_length_tokenizer: int = 77,
     mode: Literal['triplets', 'images'] = 'triplets',  # 'triplets' or 'images',
     caption_joiner: str = ' ',
+    reverse_caption_order: bool = False,
 ):
     return FashionIQ(
         images_path="data/fashioniq/images",
@@ -217,4 +224,5 @@ def build_fashioniq_dataset(
         max_length_tokenizer=max_length_tokenizer,
         mode=mode,
         caption_joiner=caption_joiner,
+        reverse_caption_order=reverse_caption_order,
     )

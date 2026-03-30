@@ -15,6 +15,50 @@ from src.retrievers.base import TwoEncoderVLM
 from src.utils.io import prepend_key_to_dict, save_records_to_csv, save_to_csv, save_to_json
 
 
+FASHIONIQ_STUDY_SETTINGS = {"default", "caption_ablation_v1"}
+
+
+def resolve_fashioniq_study_setting(
+    study_setting: str,
+    caption_joiner_mode: str,
+    caption_order_mode: str,
+) -> tuple[str, str]:
+    if study_setting not in FASHIONIQ_STUDY_SETTINGS:
+        supported = ", ".join(sorted(FASHIONIQ_STUDY_SETTINGS))
+        raise ValueError(f"Unsupported fashioniq_study_setting '{study_setting}'. Supported: {supported}")
+
+    if study_setting == "caption_ablation_v1":
+        # Preset used for the small ablation study.
+        return "and", "both"
+
+    return caption_joiner_mode, caption_order_mode
+
+
+def resolve_caption_joiner_override(mode: str) -> str | None:
+    if mode == "protocol_default":
+        return None
+    if mode == "space":
+        return " "
+    if mode == "and":
+        return " and "
+    raise ValueError(f"Unsupported fashioniq_caption_joiner_mode '{mode}'.")
+
+
+def describe_fashioniq_text_composition(
+    eval_protocol: str,
+    caption_joiner_mode: str,
+    caption_order_mode: str,
+) -> str:
+    joiner = resolve_caption_joiner_override(caption_joiner_mode)
+    if joiner is None:
+        joiner = " and " if eval_protocol == "original_split" else " "
+
+    joiner_name = "space" if joiner == " " else "' and '"
+    if caption_order_mode == "both":
+        return f"caption1 + {joiner_name} + caption2 and reversed order average"
+    return f"caption1 + {joiner_name} + caption2"
+
+
 def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         if torch.cuda.is_available():
@@ -63,6 +107,9 @@ def test_model(
     datasets: list[str],
     query_embedding_mode: str = "vista_mm",
     fashioniq_eval_protocol: str = "val_split",
+    fashioniq_study_setting: str = "default",
+    fashioniq_caption_joiner_mode: str = "protocol_default",
+    fashioniq_caption_order_mode: str = "original",
     fusion_type: str = "sum",
     batch_size: int = 64,
     num_workers: int = 4,
@@ -71,10 +118,22 @@ def test_model(
     metrics: dict[str, float] = {}
 
     if "fashioniq" in datasets:
+        effective_caption_joiner_mode, effective_caption_order_mode = resolve_fashioniq_study_setting(
+            fashioniq_study_setting,
+            fashioniq_caption_joiner_mode,
+            fashioniq_caption_order_mode,
+        )
+
+        caption_joiner_override = resolve_caption_joiner_override(
+            effective_caption_joiner_mode,
+        )
+
         fashioniq_metrics = evaluate_fashioniq(
             model=model,
             query_embedding_mode=query_embedding_mode,
             eval_protocol=fashioniq_eval_protocol,
+            caption_joiner_override=caption_joiner_override,
+            caption_order_mode=effective_caption_order_mode,
             fusion_type=fusion_type,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -120,6 +179,12 @@ def build_runtime_context(args: argparse.Namespace, device: torch.device) -> dic
         cuda_device_index = device.index if device.index is not None else int(torch.cuda.current_device())
         cuda_device_name = str(torch.cuda.get_device_name(cuda_device_index))
 
+    effective_caption_joiner_mode, effective_caption_order_mode = resolve_fashioniq_study_setting(
+        args.fashioniq_study_setting,
+        args.fashioniq_caption_joiner_mode,
+        args.fashioniq_caption_order_mode,
+    )
+
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "runtime": {
@@ -145,7 +210,18 @@ def build_runtime_context(args: argparse.Namespace, device: torch.device) -> dic
             "tqdm": bool(args.tqdm),
             "query_embedding_mode": args.query_embedding_mode,
             "fusion_type": args.fusion_type,
+            "fusion_type_effective": args.fusion_type if args.query_embedding_mode == "legacy_fusion" else "not_used_in_vista_mm",
             "fashioniq_eval_protocol": args.fashioniq_eval_protocol,
+            "fashioniq_study_setting": args.fashioniq_study_setting,
+            "fashioniq_caption_joiner_mode": args.fashioniq_caption_joiner_mode,
+            "fashioniq_caption_order_mode": args.fashioniq_caption_order_mode,
+            "fashioniq_caption_joiner_mode_effective": effective_caption_joiner_mode,
+            "fashioniq_caption_order_mode_effective": effective_caption_order_mode,
+            "fashioniq_text_composition_effective": describe_fashioniq_text_composition(
+                args.fashioniq_eval_protocol,
+                effective_caption_joiner_mode,
+                effective_caption_order_mode,
+            ),
             "skip_submission": list(args.skip_submission),
             "dataloader_pin_memory": True,
         },
@@ -198,7 +274,7 @@ def build_structured_metrics(
             protocol["split"] = split
             protocol["candidate_pool"] = "category-specific validation gallery (dress/shirt/toptee), reference removed"
             protocol["gallery_category_specific"] = True
-            protocol["text_composition"] = "caption1 + space + caption2"
+            protocol["text_composition"] = runtime_context["evaluation"]["fashioniq_text_composition_effective"]
 
             if metric.endswith("avg_recall_at5") or metric.endswith("avg_recall_at10") or metric.endswith("avg_recall_at50"):
                 protocol["score_type"] = "macro_average"
@@ -213,7 +289,7 @@ def build_structured_metrics(
             protocol["split"] = split
             protocol["candidate_pool"] = "category-specific official test gallery (dress/shirt/toptee), reference removed"
             protocol["gallery_category_specific"] = True
-            protocol["text_composition"] = "caption1 + ' and ' + caption2"
+            protocol["text_composition"] = runtime_context["evaluation"]["fashioniq_text_composition_effective"]
 
             if metric.endswith("avg_recall_at5") or metric.endswith("avg_recall_at10") or metric.endswith("avg_recall_at50"):
                 protocol["score_type"] = "macro_average"
@@ -280,14 +356,22 @@ def build_protocol_validation_summary(
                     "split": "val",
                     "candidate_pool": "category-specific gallery (dress/shirt/toptee)",
                     "reference_removed": True,
-                    "text_composition": "caption1 + space + caption2",
+                    "text_composition": "protocol_default: caption1 + space + caption2",
                 },
                 "original_split": {
                     "split": "test",
                     "candidate_pool": "category-specific official test gallery (dress/shirt/toptee)",
                     "reference_removed": True,
-                    "text_composition": "caption1 + ' and ' + caption2",
+                    "text_composition": "protocol_default: caption1 + ' and ' + caption2",
                 },
+            },
+            "active_ablation": {
+                "study_setting": runtime_context["evaluation"]["fashioniq_study_setting"],
+                "caption_joiner_mode": runtime_context["evaluation"]["fashioniq_caption_joiner_mode"],
+                "caption_order_mode": runtime_context["evaluation"]["fashioniq_caption_order_mode"],
+                "caption_joiner_mode_effective": runtime_context["evaluation"]["fashioniq_caption_joiner_mode_effective"],
+                "caption_order_mode_effective": runtime_context["evaluation"]["fashioniq_caption_order_mode_effective"],
+                "text_composition_effective": runtime_context["evaluation"]["fashioniq_text_composition_effective"],
             },
         }
 
@@ -305,6 +389,27 @@ def build_protocol_validation_summary(
         }
 
     return summary
+
+
+def write_ablation_study_note(output_path: str, args: argparse.Namespace, runtime_context: dict[str, Any]) -> None:
+    note_lines = [
+        "Ablation Study Note",
+        "",
+        "Running only retriever on these settings:",
+        f"- model: {args.model_name_or_path}",
+        f"- test sets: {', '.join(args.datasets)}",
+        f"- FashionIQ protocol: {args.fashioniq_eval_protocol}",
+        f"- encoder type: {args.query_embedding_mode}",
+        "",
+        "High-level important details:",
+        f"- FashionIQ text composition: {runtime_context['evaluation']['fashioniq_text_composition_effective']}",
+        f"- fusion_type argument: {args.fusion_type} (effective: {runtime_context['evaluation']['fusion_type_effective']})",
+        "- CIRR and FashionIQ both remove reference image from ranking before scoring",
+        "- Outputs in this run folder include metrics.csv, metrics_structured.json, evaluation_runtime.json, and evaluation_protocol.json",
+    ]
+    note_path = os.path.join(output_path, "ablation_study_note.txt")
+    with open(note_path, "w", encoding="utf-8") as file_obj:
+        file_obj.write("\n".join(note_lines) + "\n")
 
 
 def main(args: argparse.Namespace) -> None:
@@ -332,6 +437,9 @@ def main(args: argparse.Namespace) -> None:
         datasets=args.datasets,
         query_embedding_mode=args.query_embedding_mode,
         fashioniq_eval_protocol=args.fashioniq_eval_protocol,
+        fashioniq_study_setting=args.fashioniq_study_setting,
+        fashioniq_caption_joiner_mode=args.fashioniq_caption_joiner_mode,
+        fashioniq_caption_order_mode=args.fashioniq_caption_order_mode,
         fusion_type=args.fusion_type,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -362,8 +470,12 @@ def main(args: argparse.Namespace) -> None:
     run_config = vars(args).copy()
     run_config["resolved_device"] = str(device)
     run_config["runtime_metadata_file"] = "evaluation_runtime.json"
+    run_config["fusion_type_effective"] = runtime_context["evaluation"]["fusion_type_effective"]
+    run_config["fashioniq_text_composition_effective"] = runtime_context["evaluation"]["fashioniq_text_composition_effective"]
     with open(os.path.join(output_path, "run_config.json"), "w", encoding="utf-8") as file_obj:
         json.dump(run_config, file_obj, indent=2)
+
+    write_ablation_study_note(output_path=output_path, args=args, runtime_context=runtime_context)
 
     if "cirr" in args.datasets and "cirr" not in args.skip_submission:
         cirr_test_sub = generate_cirr_test_submission(
@@ -405,6 +517,27 @@ if __name__ == "__main__":
         default="val_split",
         choices=["val_split", "original_split"],
         help="FashionIQ evaluation protocol: val_split (internal baseline) or original_split (benchmark-comparable).",
+    )
+    parser.add_argument(
+        "--fashioniq_study_setting",
+        type=str,
+        default="default",
+        choices=["default", "caption_ablation_v1"],
+        help="Optional preset study setting. 'default' preserves old behavior; 'caption_ablation_v1' applies and-joiner + both-order averaging.",
+    )
+    parser.add_argument(
+        "--fashioniq_caption_joiner_mode",
+        type=str,
+        default="protocol_default",
+        choices=["protocol_default", "space", "and"],
+        help="FashionIQ caption joiner ablation: protocol default, force space, or force 'and'.",
+    )
+    parser.add_argument(
+        "--fashioniq_caption_order_mode",
+        type=str,
+        default="original",
+        choices=["original", "both"],
+        help="FashionIQ caption order ablation: use original caption order only, or average original+reversed order.",
     )
     parser.add_argument("--batch_size", type=int, default=64, help="Evaluation batch size.")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers.")
