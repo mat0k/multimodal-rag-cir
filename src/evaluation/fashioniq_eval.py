@@ -12,6 +12,7 @@ from src.utils.tensor import make_normalized
 
 
 QUERY_EMBEDDING_MODES = {"legacy_fusion", "vista_mm"}
+CAPTION_ORDER_MODES = {"original", "both"}
 
 
 FASHIONIQ_EVAL_PROTOCOLS = {
@@ -36,6 +37,26 @@ def resolve_fashioniq_eval_protocol(eval_protocol: str) -> dict[str, str]:
         supported = ", ".join(sorted(FASHIONIQ_EVAL_PROTOCOLS.keys()))
         raise ValueError(f"Unsupported FashionIQ eval protocol '{eval_protocol}'. Supported: {supported}")
     return FASHIONIQ_EVAL_PROTOCOLS[eval_protocol].copy()
+
+
+def resolve_caption_order_mode(caption_order_mode: str) -> str:
+    if caption_order_mode not in CAPTION_ORDER_MODES:
+        supported = ", ".join(sorted(CAPTION_ORDER_MODES))
+        raise ValueError(
+            f"Unsupported caption_order_mode '{caption_order_mode}'. Supported: {supported}"
+        )
+    return caption_order_mode
+
+
+def resolve_caption_joiner(
+    protocol_caption_joiner: str,
+    caption_joiner_override: Optional[str],
+) -> str:
+    if caption_joiner_override is None:
+        return protocol_caption_joiner
+    if caption_joiner_override not in {" ", " and "}:
+        raise ValueError("caption_joiner_override must be either ' ' or ' and '.")
+    return caption_joiner_override
 
 
 def _get_module_device(module: torch.nn.Module) -> torch.device:
@@ -385,8 +406,15 @@ def evaluate_fashioniq(
     tqdm : bool = False,
     accelerator=None,
     eval_protocol: str = "val_split",
+    caption_joiner_override: Optional[str] = None,
+    caption_order_mode: Literal["original", "both"] = "original",
 ):
     protocol_config = resolve_fashioniq_eval_protocol(eval_protocol)
+    resolved_caption_order_mode = resolve_caption_order_mode(caption_order_mode)
+    resolved_caption_joiner = resolve_caption_joiner(
+        protocol_caption_joiner=protocol_config["caption_joiner"],
+        caption_joiner_override=caption_joiner_override,
+    )
 
     fashioniq_index = build_fashioniq_dataset(
         split=protocol_config["split"],
@@ -394,7 +422,7 @@ def evaluate_fashioniq(
         image_transform=model.image_processor,
         caption_transform=model.tokenizer,
         max_length_tokenizer=77,
-        caption_joiner=protocol_config["caption_joiner"],
+        caption_joiner=resolved_caption_joiner,
     )
 
     fashioniq_triplets = build_fashioniq_dataset(
@@ -403,7 +431,8 @@ def evaluate_fashioniq(
         image_transform=model.image_processor,
         caption_transform=model.tokenizer,
         max_length_tokenizer=77,
-        caption_joiner=protocol_config["caption_joiner"],
+        caption_joiner=resolved_caption_joiner,
+        reverse_caption_order=False,
     )
 
     index_features, index_names, index_classes  = generate_fashioniq_index_features(
@@ -425,6 +454,39 @@ def evaluate_fashioniq(
         use_tqdm=tqdm,
         accelerator=accelerator
     )
+
+    if resolved_caption_order_mode == "both":
+        fashioniq_triplets_reversed = build_fashioniq_dataset(
+            split=protocol_config["split"],
+            mode='triplets',
+            image_transform=model.image_processor,
+            caption_transform=model.tokenizer,
+            max_length_tokenizer=77,
+            caption_joiner=resolved_caption_joiner,
+            reverse_caption_order=True,
+        )
+
+        reversed_features, reversed_reference_names, reversed_target_names, reversed_triplet_classes = (
+            generate_fashioniq_predicted_features(
+                clip_model=model,
+                triplet_dataset=fashioniq_triplets_reversed,
+                query_embedding_mode=query_embedding_mode,
+                fusion_type=fusion_type,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                use_tqdm=tqdm,
+                accelerator=accelerator,
+            )
+        )
+
+        if (
+            reversed_reference_names != reference_names
+            or reversed_target_names != target_names
+            or reversed_triplet_classes != triplet_classes
+        ):
+            raise ValueError("Caption-order ablation mismatch: triplet ordering changed unexpectedly.")
+
+        predicted_features = make_normalized((predicted_features + reversed_features) / 2.0)
 
     if any(target_name is None for target_name in target_names):
         if protocol_config["split"] == "test":
