@@ -240,6 +240,7 @@ def process_messages_to_inputs(
 	processor: Any,
 	messages: Sequence[Message],
 	device: torch.device | str,
+	move_to_device: bool = True,
 ) -> dict[str, torch.Tensor]:
 	"""Convert chat messages into model-ready tensors and move to device."""
 	texts = apply_chat_templates(processor=processor, messages=messages)
@@ -259,7 +260,9 @@ def process_messages_to_inputs(
 		processor_kwargs["videos"] = video_inputs
 
 	model_inputs = processor(**processor_kwargs)
-	return model_inputs.to(device)
+	if move_to_device:
+		return model_inputs.to(device)
+	return model_inputs
 
 
 __all__ = [

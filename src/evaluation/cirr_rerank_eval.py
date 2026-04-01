@@ -96,7 +96,18 @@ def rerank_query_candidates(
 			)
 		)
 
-	scores = reranker.score_batch(query=rerank_query, candidates=candidate_items)
+	scores: list[float] = []
+	for idx, candidate in enumerate(candidate_items):
+		if idx == 0:
+			print("DEBUG_CIRR_EVAL: before first single score call", flush=True)
+		if idx == 1:
+			print("DEBUG_CIRR_EVAL: before second single score call", flush=True)
+		score = reranker.score(query=rerank_query, candidate=candidate)
+		scores.append(score)
+		if idx == 0:
+			print(f"DEBUG_CIRR_EVAL: after first single score returns score={score}", flush=True)
+		if idx == 1:
+			print(f"DEBUG_CIRR_EVAL: after second single score returns score={score}", flush=True)
 	ranked_pairs = sorted(zip(candidate_ids, scores), key=lambda item: item[1], reverse=True)
 	return [candidate_id for candidate_id, _ in ranked_pairs]
 
@@ -121,10 +132,17 @@ def evaluate_cirr_standalone_rerank(
 	if split == "test1":
 		raise ValueError("Standalone rerank evaluation requires a split with targets. Use split='val' or 'train'.")
 
+	print("DEBUG_CIRR_EVAL: entering evaluate_cirr_standalone_rerank", flush=True)
+
 	if image_dataset is None:
+		print("DEBUG_CIRR_EVAL: creating/loading image dataset", flush=True)
 		image_dataset = build_cirr_dataset(split=split, mode="images", image_transform=None, caption_transform=None)
 	if triplet_dataset is None:
+		print("DEBUG_CIRR_EVAL: creating/loading triplet dataset", flush=True)
 		triplet_dataset = build_cirr_dataset(split=split, mode="triplets", image_transform=None, caption_transform=None)
+
+	print(f"DEBUG_CIRR_EVAL: triplet dataset length = {len(triplet_dataset)}", flush=True)
+	print(f"DEBUG_CIRR_EVAL: image dataset length = {len(image_dataset)}", flush=True)
 
 	k_values = _resolve_k_values(k_values)
 
@@ -153,7 +171,11 @@ def evaluate_cirr_standalone_rerank(
 	if use_tqdm:
 		indices = tqdm(indices, desc="Evaluating CIRR standalone reranker")
 
+	print("DEBUG_CIRR_EVAL: starting query loop", flush=True)
+
 	for idx in indices:
+		if idx == 0:
+			print("DEBUG_CIRR_EVAL: fetching first query", flush=True)
 		sample = triplet_dataset[idx]
 		query = CIRRStandaloneQuery(
 			pair_id=sample["pair_id"],
@@ -164,16 +186,30 @@ def evaluate_cirr_standalone_rerank(
 			group_members=sample["group_members"],
 		)
 
+		if idx == 0:
+			print(
+				f"DEBUG_CIRR_EVAL: first query id / target id = {query.pair_id} / {query.target_name}",
+				flush=True,
+			)
+
+		if idx == 0:
+			print("DEBUG_CIRR_EVAL: building candidate pool", flush=True)
 		candidate_ids = pool_builder(query, all_candidate_ids, rng)
+		if idx == 0:
+			print(f"DEBUG_CIRR_EVAL: candidate pool size = {len(candidate_ids)}", flush=True)
 		if query.target_name not in candidate_ids:
 			raise ValueError(f"Target '{query.target_name}' missing from candidate pool for pair_id={query.pair_id}.")
 
+		if idx == 0:
+			print("DEBUG_CIRR_EVAL: entering single-item scoring path", flush=True)
 		ranked_ids = rerank_query_candidates(
 			reranker=reranker,
 			query=query,
 			candidate_ids=candidate_ids,
 			image_dataset=image_dataset,
 		)
+		if idx == 0:
+			print("DEBUG_CIRR_EVAL: after first scoring call returns", flush=True)
 
 		pool_sizes.append(len(ranked_ids))
 		for k in k_values:
@@ -188,6 +224,7 @@ def evaluate_cirr_standalone_rerank(
 		"avg_candidate_pool_size": float(sum(pool_sizes) / max(1, len(pool_sizes))),
 		"num_random_distractors": float(num_random_distractors),
 	}
+	print("DEBUG_CIRR_EVAL: before metrics aggregation", flush=True)
 
 	for k in k_values:
 		metric_name = f"recall_at{k}"
@@ -195,6 +232,8 @@ def evaluate_cirr_standalone_rerank(
 			metrics[metric_name] = float("nan")
 		else:
 			metrics[metric_name] = float((hits[k] / eligible[k]) * 100.0)
+
+	print("DEBUG_CIRR_EVAL: before function return", flush=True)
 
 	return metrics
 
