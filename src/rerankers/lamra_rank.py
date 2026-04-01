@@ -40,6 +40,10 @@ class LamRARanker(BaseReranker):
 		model_name_or_path: str,
 		device: str = "auto",
 		dtype: str = "bfloat16",
+		quantization_mode: str = "none",
+		quantization_compute_dtype: str = "float16",
+		quantization_double_quant: bool = True,
+		quantization_cpu_offload: bool = False,
 		trust_remote_code: bool = True,
 		local_files_only: bool = True,
 		revision: str = "main",
@@ -50,11 +54,21 @@ class LamRARanker(BaseReranker):
 		self.device = self._resolve_device(device)
 		print(f"DEBUG_LAMRA_INIT: resolved runtime device={self.device}", flush=True)
 		self.dtype = self._resolve_dtype(dtype)
+		self.quantization_mode = quantization_mode.lower()
+		self.quantization_compute_dtype = self._resolve_dtype(quantization_compute_dtype)
+		self.quantization_double_quant = quantization_double_quant
+		self.quantization_cpu_offload = quantization_cpu_offload
 		self.trust_remote_code = trust_remote_code
 		self.local_files_only = local_files_only
 		self.revision = revision
 		self.low_cpu_mem_usage = low_cpu_mem_usage
 		self.emb_token = emb_token
+
+		valid_modes = {"none", "8bit", "4bit", "auto"}
+		if self.quantization_mode not in valid_modes:
+			raise ValueError(
+				f"Unsupported quantization_mode '{quantization_mode}'. Supported: {sorted(valid_modes)}"
+			)
 
 		self.model: Qwen2_5_VLForConditionalGeneration | None = None
 		self.processor: Any = None
@@ -86,6 +100,10 @@ class LamRARanker(BaseReranker):
 			model_name_or_path=str(model_name_or_path),
 			device=str(runtime_cfg.get("device", "auto")),
 			dtype=str(runtime_cfg.get("dtype", "bfloat16")),
+			quantization_mode=str(runtime_cfg.get("quantization_mode", "none")),
+			quantization_compute_dtype=str(runtime_cfg.get("quantization_compute_dtype", "float16")),
+			quantization_double_quant=bool(runtime_cfg.get("quantization_double_quant", True)),
+			quantization_cpu_offload=bool(runtime_cfg.get("quantization_cpu_offload", False)),
 			trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
 			local_files_only=bool(model_cfg.get("local_files_only", True)),
 			revision=str(model_cfg.get("revision", "main")),
@@ -99,17 +117,104 @@ class LamRARanker(BaseReranker):
 		self._ensure_chat_template(self.processor, self.model_name_or_path)
 		self.tokenizer = self.processor.tokenizer
 
-		self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-			self.model_name_or_path,
-			torch_dtype=self.dtype,
-			low_cpu_mem_usage=self.low_cpu_mem_usage,
-			trust_remote_code=self.trust_remote_code,
-			local_files_only=self.local_files_only,
-			revision=self.revision,
-		).to(self.device)
+		base_model_kwargs: dict[str, Any] = {
+			"low_cpu_mem_usage": self.low_cpu_mem_usage,
+			"trust_remote_code": self.trust_remote_code,
+			"local_files_only": self.local_files_only,
+			"revision": self.revision,
+		}
+
+		if self.quantization_mode == "none":
+			self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+				self.model_name_or_path,
+				torch_dtype=self.dtype,
+				**base_model_kwargs,
+			).to(self.device)
+		else:
+			self.model = self._load_model_with_quantization(base_model_kwargs)
 		self.model.eval()
 
 		self.emb_token_id = self._ensure_embed_token(self.emb_token)
+
+	def _load_model_with_quantization(
+		self,
+		base_model_kwargs: Mapping[str, Any],
+	) -> Qwen2_5_VLForConditionalGeneration:
+		"""Load model with 8bit/4bit quantization and fallback attempts."""
+		try:
+			from transformers import BitsAndBytesConfig
+		except Exception as exc:
+			raise RuntimeError(
+				"Quantization mode requested, but BitsAndBytesConfig is unavailable. "
+				"Install compatible bitsandbytes/transformers/accelerate packages."
+			) from exc
+
+		attempts = ["8bit", "4bit"] if self.quantization_mode == "auto" else [self.quantization_mode]
+		load_errors: list[str] = []
+
+		for attempt in attempts:
+			try:
+				if attempt == "8bit":
+					quantization_config = BitsAndBytesConfig(
+						load_in_8bit=True,
+						llm_int8_enable_fp32_cpu_offload=self.quantization_cpu_offload,
+					)
+				elif attempt == "4bit":
+					quantization_config = BitsAndBytesConfig(
+						load_in_4bit=True,
+						bnb_4bit_quant_type="nf4",
+						bnb_4bit_compute_dtype=self.quantization_compute_dtype,
+						bnb_4bit_use_double_quant=self.quantization_double_quant,
+					)
+				else:
+					raise ValueError(f"Unsupported quantization attempt '{attempt}'.")
+
+				device_map = self._resolve_quantized_device_map()
+				model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+					self.model_name_or_path,
+					quantization_config=quantization_config,
+					device_map=device_map,
+					torch_dtype=self.quantization_compute_dtype,
+					**dict(base_model_kwargs),
+				)
+				print(
+					f"DEBUG_LAMRA_INIT: quantized model load succeeded with mode={attempt}, device_map={device_map}",
+					flush=True,
+				)
+				self.quantization_mode = attempt
+				return model
+			except Exception as exc:
+				load_errors.append(f"{attempt}: {exc}")
+				print(
+					f"DEBUG_LAMRA_INIT: quantized load failed for mode={attempt}; trying next fallback if available",
+					flush=True,
+				)
+
+		raise RuntimeError(
+			"Failed to load quantized LamRA model. Attempt errors: " + " | ".join(load_errors)
+		)
+
+	def _resolve_quantized_device_map(self) -> Any:
+		if self.device.type == "cuda":
+			if self.quantization_cpu_offload:
+				return "auto"
+			return {"": int(self.device.index or 0)}
+		if self.device.type == "cpu":
+			return {"": "cpu"}
+		return "auto"
+
+	def _resolve_model_device(self) -> torch.device:
+		if self.model is None:
+			return self.device
+
+		model_device = getattr(self.model, "device", None)
+		if isinstance(model_device, torch.device):
+			return model_device
+
+		for param in self.model.parameters():
+			if param.device.type != "meta":
+				return param.device
+		return self.device
 
 	@staticmethod
 	def _ensure_chat_template(processor: Qwen2_5_VLProcessor, model_name_or_path: str) -> None:
@@ -240,7 +345,7 @@ class LamRARanker(BaseReranker):
 			raise RuntimeError("LamRARanker is not initialized. Call load_model() first.")
 
 		print("DEBUG_LAMRA_SCORE: 1 entering score(...)", flush=True)
-		model_device = next(self.model.parameters()).device
+		model_device = self._resolve_model_device()
 		print(f"DEBUG_LAMRA_SCORE: model device={model_device}", flush=True)
 
 		print("DEBUG_LAMRA_SCORE: 2 building joint prompt/message", flush=True)
@@ -280,7 +385,7 @@ class LamRARanker(BaseReranker):
 		no_token_id = self._get_single_token_id(" no")
 
 		# Temporary pre-forward diagnostics for device placement and tensor layout.
-		param_device = next(self.model.parameters()).device
+		param_device = self._resolve_model_device()
 		pixel_values = joint_inputs.get("pixel_values")
 		shape_info = {
 			key: tuple(value.shape)
@@ -304,6 +409,7 @@ class LamRARanker(BaseReranker):
 			logits = self.model(
 				**joint_inputs,
 				return_dict=True,
+				use_cache=False,
 			).logits
 			print("DEBUG_LAMRA_SCORE: 9 model forward finished", flush=True)
 

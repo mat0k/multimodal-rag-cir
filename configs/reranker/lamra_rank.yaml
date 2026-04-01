@@ -13,6 +13,12 @@ model:
 runtime:
   device: auto
   dtype: bfloat16
+  # Quantization experiment knobs for low-VRAM GPUs (none | 8bit | 4bit | auto)
+  quantization_mode: none
+  # Recommended compute dtype for RTX quantized inference is float16.
+  quantization_compute_dtype: float16
+  quantization_double_quant: true
+  quantization_cpu_offload: false
   torch_compile: false
   gradient_checkpointing: false
 
