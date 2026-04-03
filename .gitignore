@@ -35,7 +35,6 @@ MANIFEST
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
-*.out
 
 # Unit test / coverage reports
 htmlcov/
@@ -225,7 +224,7 @@ results/
 *.out
 *.err
 logs/
-
+ 
 # Data images (large binary files — keep only annotations in git)
 data/cirr/images/
 data/fashioniq/images/
@@ -236,3 +235,9 @@ data/fashioniq
 
 # Local-only handoff notes for agent sessions
 LOCAL_AGENT_REFERENCE.md
+phase-2.0.local.md
+RUN_SETTINGS.local.md
+
+/lamRA_hierachy.txt
+
+jobs/
