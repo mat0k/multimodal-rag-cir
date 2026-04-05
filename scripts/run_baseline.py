@@ -475,7 +475,9 @@ def main(args: argparse.Namespace) -> None:
     with open(os.path.join(output_path, "run_config.json"), "w", encoding="utf-8") as file_obj:
         json.dump(run_config, file_obj, indent=2)
 
-    write_ablation_study_note(output_path=output_path, args=args, runtime_context=runtime_context)
+    # Ablation note is only generated for explicit ablation runs.
+    if args.fashioniq_study_setting != "default":
+        write_ablation_study_note(output_path=output_path, args=args, runtime_context=runtime_context)
 
     if "cirr" in args.datasets and "cirr" not in args.skip_submission:
         cirr_test_sub = generate_cirr_test_submission(
