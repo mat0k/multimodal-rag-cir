@@ -4,8 +4,8 @@ seed: 42
 
 model:
   name: LamRA-Rank-Qwen2.5VL-7b
-  checkpoint_path: /nfs/home/hassan/multimodal-rag-cir/models/LamRA-Rank-Qwen2.5VL-7b
-  model_name_or_path: /nfs/home/hassan/multimodal-rag-cir/models/LamRA-Rank-Qwen2.5VL-7b
+  checkpoint_path: /nfs/home/maatouk/multimodal-rag-cir/models/LamRA-Rank-Qwen2.5VL-7b
+  model_name_or_path: /nfs/home/maatouk/multimodal-rag-cir/models/LamRA-Rank-Qwen2.5VL-7b
   trust_remote_code: true
   local_files_only: true
   revision: main
