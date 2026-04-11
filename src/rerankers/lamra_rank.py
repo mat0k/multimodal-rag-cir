@@ -45,16 +45,25 @@ class LamRARanker(BaseReranker):
 		revision: str = "main",
 		low_cpu_mem_usage: bool = True,
 		emb_token: str = "<emb>",
+		image_root: str | None = None,
+		rgb_only: bool = True,
+		resize_short_edge: int | None = None,
+		center_crop: int | None = None,
+		interpolation: str = "bicubic",
 	) -> None:
 		self.model_name_or_path = model_name_or_path
 		self.device = self._resolve_device(device)
-		print(f"DEBUG_LAMRA_INIT: resolved runtime device={self.device}", flush=True)
 		self.dtype = self._resolve_dtype(dtype)
 		self.trust_remote_code = trust_remote_code
 		self.local_files_only = local_files_only
 		self.revision = revision
 		self.low_cpu_mem_usage = low_cpu_mem_usage
 		self.emb_token = emb_token
+		self.image_root = image_root
+		self.rgb_only = rgb_only
+		self.resize_short_edge = resize_short_edge
+		self.center_crop = center_crop
+		self.interpolation = interpolation
 
 		self.model: Qwen2_5_VLForConditionalGeneration | None = None
 		self.processor: Any = None
@@ -73,6 +82,7 @@ class LamRARanker(BaseReranker):
 
 		model_cfg = dict(config_data.get("model", {}))
 		runtime_cfg = dict(config_data.get("runtime", {}))
+		image_cfg = dict(config_data.get("image_io", {}))
 
 		model_name_or_path = (
 			model_cfg.get("checkpoint_path")
@@ -89,6 +99,19 @@ class LamRARanker(BaseReranker):
 			trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
 			local_files_only=bool(model_cfg.get("local_files_only", True)),
 			revision=str(model_cfg.get("revision", "main")),
+			image_root=str(image_cfg.get("image_root")) if image_cfg.get("image_root") else None,
+			rgb_only=bool(image_cfg.get("rgb_only", True)),
+			resize_short_edge=(
+				int(image_cfg["resize_short_edge"])
+				if image_cfg.get("resize_short_edge") is not None
+				else None
+			),
+			center_crop=(
+				int(image_cfg["center_crop"])
+				if image_cfg.get("center_crop") is not None
+				else None
+			),
+			interpolation=str(image_cfg.get("interpolation", "bicubic")),
 		)
 
 	def load_model(self) -> None:
@@ -238,14 +261,24 @@ class LamRARanker(BaseReranker):
 		"""
 		if self.model is None or self.processor is None or self.emb_token_id is None:
 			raise RuntimeError("LamRARanker is not initialized. Call load_model() first.")
-
-		print("DEBUG_LAMRA_SCORE: 1 entering score(...)", flush=True)
 		model_device = next(self.model.parameters()).device
-		print(f"DEBUG_LAMRA_SCORE: model device={model_device}", flush=True)
 
-		print("DEBUG_LAMRA_SCORE: 2 building joint prompt/message", flush=True)
-		reference_image = load_image_item(query.reference_image)
-		candidate_image = load_image_item(candidate.image)
+		reference_image = load_image_item(
+			query.reference_image,
+			image_root=self.image_root,
+			rgb_only=self.rgb_only,
+			resize_short_edge=self.resize_short_edge,
+			center_crop=self.center_crop,
+			interpolation=self.interpolation,
+		)
+		candidate_image = load_image_item(
+			candidate.image,
+			image_root=self.image_root,
+			rgb_only=self.rgb_only,
+			resize_short_edge=self.resize_short_edge,
+			center_crop=self.center_crop,
+			interpolation=self.interpolation,
+		)
 		joint_messages = [
 			build_pointwise_relevance_message(
 				reference_image=reference_image,
@@ -253,69 +286,29 @@ class LamRARanker(BaseReranker):
 				candidate_image=candidate_image,
 			)
 		]
-		print("DEBUG_LAMRA_SCORE: 3 prompt/message built", flush=True)
 
-		print("DEBUG_LAMRA_SCORE: 4 starting preprocessing", flush=True)
 		joint_inputs = process_messages_to_inputs(
 			processor=self.processor,
 			messages=joint_messages,
 			device=self.device,
 			move_to_device=False,
 		)
-		print("DEBUG_LAMRA_SCORE: 5 preprocessing finished", flush=True)
 
-		print("DEBUG_LAMRA_SCORE: 6 moving tensors to device", flush=True)
 		joint_inputs = joint_inputs.to(model_device)
-		input_ids = joint_inputs.get("input_ids")
-		if input_ids is not None:
-			print(
-				f"DEBUG_LAMRA_SCORE: input tensor device={input_ids.device}, shape={tuple(input_ids.shape)}",
-				flush=True,
-			)
-		else:
-			print("DEBUG_LAMRA_SCORE: input_ids not found in model inputs", flush=True)
-		print("DEBUG_LAMRA_SCORE: 7 tensors moved", flush=True)
 
 		yes_token_id = self._get_single_token_id(" yes")
 		no_token_id = self._get_single_token_id(" no")
 
-		# Temporary pre-forward diagnostics for device placement and tensor layout.
-		param_device = next(self.model.parameters()).device
-		pixel_values = joint_inputs.get("pixel_values")
-		shape_info = {
-			key: tuple(value.shape)
-			for key, value in joint_inputs.items()
-			if hasattr(value, "shape")
-		}
-		print(f"DEBUG_LAMRA_SCORE: pre-forward model device={model_device}", flush=True)
-		print(f"DEBUG_LAMRA_SCORE: pre-forward parameter device={param_device}", flush=True)
-		print(
-			f"DEBUG_LAMRA_SCORE: pre-forward input_ids device={input_ids.device if input_ids is not None else 'MISSING'}",
-			flush=True,
-		)
-		print(
-			f"DEBUG_LAMRA_SCORE: pre-forward pixel_values device={pixel_values.device if pixel_values is not None else 'MISSING'}",
-			flush=True,
-		)
-		print(f"DEBUG_LAMRA_SCORE: pre-forward input tensor shapes={shape_info}", flush=True)
-
 		with torch.no_grad():
-			print("DEBUG_LAMRA_SCORE: 8 starting model forward pass", flush=True)
 			logits = self.model(
 				**joint_inputs,
 				return_dict=True,
 			).logits
-			print("DEBUG_LAMRA_SCORE: 9 model forward finished", flush=True)
-
-			print("DEBUG_LAMRA_SCORE: 10 extracting yes/no logits", flush=True)
 			next_token_logits = logits[:, -1, :]
 			yes_logit = next_token_logits[:, yes_token_id]
 			no_logit = next_token_logits[:, no_token_id]
 			binary_logits = torch.stack([no_logit, yes_logit], dim=1)
 			prob_yes = torch.softmax(binary_logits, dim=1)[:, 1]
-			print("DEBUG_LAMRA_SCORE: 11 score computed", flush=True)
-
-		print("DEBUG_LAMRA_SCORE: 12 returning score", flush=True)
 		return float(prob_yes.item())
 
 	def score_batch(self, query: RerankQuery, candidates: Sequence[RerankCandidate]) -> list[float]:

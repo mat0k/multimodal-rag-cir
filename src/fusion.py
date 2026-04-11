@@ -24,7 +24,7 @@ def fusion(
     text_features: torch.Tensor,
     fusion_type: str = "sum",
     alpha: float = 0.5,
-) -> torch.Tensor:
+) -> torch.Tensor:  
     if image_features.shape != text_features.shape:
         raise ValueError(
             f"Fusion expects same shape tensors. Got image={image_features.shape}, text={text_features.shape}."

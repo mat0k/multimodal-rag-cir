@@ -57,6 +57,9 @@ def load_image_item(
 	image: str | Path | Image.Image,
 	image_root: str | Path | None = None,
 	rgb_only: bool = True,
+	resize_short_edge: int | None = None,
+	center_crop: int | None = None,
+	interpolation: str = "bicubic",
 ) -> Image.Image:
 	"""Load an image path/PIL input into a normalized PIL image object."""
 	if isinstance(image, Image.Image):
@@ -71,6 +74,34 @@ def load_image_item(
 
 	if rgb_only and pil_image.mode != "RGB":
 		pil_image = pil_image.convert("RGB")
+
+	if resize_short_edge is not None and resize_short_edge > 0:
+		width, height = pil_image.size
+		short_edge = min(width, height)
+		if short_edge > 0 and short_edge != resize_short_edge:
+			scale = float(resize_short_edge) / float(short_edge)
+			new_size = (
+				max(1, int(round(width * scale))),
+				max(1, int(round(height * scale))),
+			)
+			interp_map = {
+				"nearest": Image.Resampling.NEAREST,
+				"bilinear": Image.Resampling.BILINEAR,
+				"bicubic": Image.Resampling.BICUBIC,
+				"lanczos": Image.Resampling.LANCZOS,
+			}
+			resample = interp_map.get(str(interpolation).lower(), Image.Resampling.BICUBIC)
+			pil_image = pil_image.resize(new_size, resample=resample)
+
+	if center_crop is not None and center_crop > 0:
+		width, height = pil_image.size
+		crop_size = min(center_crop, width, height)
+		left = max(0, (width - crop_size) // 2)
+		top = max(0, (height - crop_size) // 2)
+		right = left + crop_size
+		bottom = top + crop_size
+		pil_image = pil_image.crop((left, top, right, bottom))
+
 	return pil_image
 
 
@@ -248,6 +279,13 @@ def process_messages_to_inputs(
 		image_inputs, video_inputs = _fallback_process_vision_info(messages)
 	else:
 		image_inputs, video_inputs = process_vision_info(messages)
+
+	# qwen_vl_utils may return None for one modality when absent.
+	# Normalize to per-sample lists so downstream checks remain robust.
+	if image_inputs is None:
+		image_inputs = [None] * len(messages)
+	if video_inputs is None:
+		video_inputs = [None] * len(messages)
 
 	processor_kwargs: dict[str, Any] = {
 		"text": texts,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -122,6 +123,8 @@ def evaluate_fashioniq_standalone_rerank(
 	if split == "test":
 		raise ValueError("Standalone rerank evaluation requires a split with targets. Use split='val' or 'train'.")
 
+	eval_start_time = time.perf_counter()
+
 	if image_dataset is None:
 		image_dataset = build_fashioniq_dataset(
 			split=split,
@@ -162,12 +165,17 @@ def evaluate_fashioniq_standalone_rerank(
 	hits: dict[str, dict[int, int]] = {cls: {k: 0 for k in k_values} for cls in image_dataset.classes}
 	eligible: dict[str, dict[int, int]] = {cls: {k: 0 for k in k_values} for cls in image_dataset.classes}
 	pool_sizes: list[int] = []
+	class_query_counts: dict[str, int] = {cls: 0 for cls in image_dataset.classes}
+	class_scored_pairs: dict[str, int] = {cls: 0 for cls in image_dataset.classes}
+	class_latency_seconds: dict[str, float] = {cls: 0.0 for cls in image_dataset.classes}
+	total_scored_pairs = 0
 
 	indices = range(query_count)
 	if use_tqdm:
 		indices = tqdm(indices, desc="Evaluating FashionIQ standalone reranker")
 
 	for idx in indices:
+		query_start_time = time.perf_counter()
 		sample = triplet_dataset[idx]
 		target_name = sample.get("target_name")
 		if not target_name:
@@ -207,8 +215,13 @@ def evaluate_fashioniq_standalone_rerank(
 			candidate_ids=candidate_ids,
 			image_dataset=image_dataset,
 		)
+		query_elapsed = time.perf_counter() - query_start_time
 
 		pool_sizes.append(len(ranked_ids))
+		total_scored_pairs += len(ranked_ids)
+		class_query_counts[query.query_class] += 1
+		class_scored_pairs[query.query_class] += len(ranked_ids)
+		class_latency_seconds[query.query_class] += query_elapsed
 		for k in k_values:
 			if len(ranked_ids) < k:
 				continue
@@ -216,13 +229,25 @@ def evaluate_fashioniq_standalone_rerank(
 			if query.target_name in ranked_ids[:k]:
 				hits[query.query_class][k] += 1
 
+	elapsed_seconds = time.perf_counter() - eval_start_time
+	scored_queries = len(pool_sizes)
+
 	metrics: dict[str, float] = {
 		"num_queries": float(query_count),
 		"avg_candidate_pool_size": float(sum(pool_sizes) / max(1, len(pool_sizes))),
 		"num_random_distractors": float(num_random_distractors),
+		"scored_pairs": float(total_scored_pairs),
+		"latency_seconds": float(elapsed_seconds),
+		"latency_seconds_per_query": float(elapsed_seconds / max(1, scored_queries)),
+		"latency_seconds_per_scored_pair": float(elapsed_seconds / max(1, total_scored_pairs)),
 	}
 
 	for cls in image_dataset.classes:
+		metrics[f"{metric_prefix}_{cls}_latency_seconds"] = float(class_latency_seconds[cls])
+		metrics[f"{metric_prefix}_{cls}_latency_seconds_per_query"] = float(
+			class_latency_seconds[cls] / max(1, class_query_counts[cls])
+		)
+		metrics[f"{metric_prefix}_{cls}_scored_pairs"] = float(class_scored_pairs[cls])
 		for k in k_values:
 			metric_name = f"{metric_prefix}_{cls}_recall_at{k}"
 			if eligible[cls][k] == 0:

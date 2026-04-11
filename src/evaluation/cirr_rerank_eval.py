@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -132,6 +133,8 @@ def evaluate_cirr_standalone_rerank(
 	if split == "test1":
 		raise ValueError("Standalone rerank evaluation requires a split with targets. Use split='val' or 'train'.")
 
+	eval_start_time = time.perf_counter()
+
 	print("DEBUG_CIRR_EVAL: entering evaluate_cirr_standalone_rerank", flush=True)
 
 	if image_dataset is None:
@@ -166,6 +169,7 @@ def evaluate_cirr_standalone_rerank(
 	hits = {k: 0 for k in k_values}
 	eligible = {k: 0 for k in k_values}
 	pool_sizes: list[int] = []
+	total_scored_pairs = 0
 
 	indices = range(query_count)
 	if use_tqdm:
@@ -212,6 +216,7 @@ def evaluate_cirr_standalone_rerank(
 			print("DEBUG_CIRR_EVAL: after first scoring call returns", flush=True)
 
 		pool_sizes.append(len(ranked_ids))
+		total_scored_pairs += len(ranked_ids)
 		for k in k_values:
 			if len(ranked_ids) < k:
 				continue
@@ -219,10 +224,17 @@ def evaluate_cirr_standalone_rerank(
 			if query.target_name in ranked_ids[:k]:
 				hits[k] += 1
 
+	elapsed_seconds = time.perf_counter() - eval_start_time
+	scored_queries = len(pool_sizes)
+
 	metrics: dict[str, float] = {
 		"num_queries": float(query_count),
 		"avg_candidate_pool_size": float(sum(pool_sizes) / max(1, len(pool_sizes))),
 		"num_random_distractors": float(num_random_distractors),
+		"scored_pairs": float(total_scored_pairs),
+		"latency_seconds": float(elapsed_seconds),
+		"latency_seconds_per_query": float(elapsed_seconds / max(1, scored_queries)),
+		"latency_seconds_per_scored_pair": float(elapsed_seconds / max(1, total_scored_pairs)),
 	}
 	print("DEBUG_CIRR_EVAL: before metrics aggregation", flush=True)
 
