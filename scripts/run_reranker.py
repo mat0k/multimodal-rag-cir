@@ -58,6 +58,7 @@ def run_standalone_evaluation(
 	candidate_cfg = config.get("standalone_candidate_pool", {})
 	num_random_distractors = int(candidate_cfg.get("num_random_negatives", 31))
 	seed = int(config.get("seed", 42))
+	use_tqdm = bool(config.get("runtime", {}).get("tqdm", False))
 
 	if dataset == "cirr":
 		cirr_cfg = config.get("datasets", {}).get("cirr", {})
@@ -69,7 +70,7 @@ def run_standalone_evaluation(
 			num_random_distractors=num_random_distractors,
 			seed=seed,
 			k_values=k_values,
-			use_tqdm=True,
+			use_tqdm=use_tqdm,
 		)
 
 	if dataset == "fashioniq":
@@ -91,7 +92,7 @@ def run_standalone_evaluation(
 			num_random_distractors=num_random_distractors,
 			seed=seed,
 			k_values=k_values,
-			use_tqdm=True,
+			use_tqdm=use_tqdm,
 		)
 
 	raise ValueError(f"Unsupported dataset '{dataset}'. Supported: cirr, fashioniq.")

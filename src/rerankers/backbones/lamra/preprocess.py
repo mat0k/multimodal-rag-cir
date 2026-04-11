@@ -66,8 +66,25 @@ def load_image_item(
 		pil_image = image
 	else:
 		image_path = Path(image)
-		if not image_path.is_absolute() and image_root is not None:
-			image_path = Path(image_root) / image_path
+		if not image_path.is_absolute() and not image_path.exists():
+			search_candidates: list[Path] = []
+			root_name = ""
+			if image_root is not None:
+				image_root_path = Path(image_root)
+				root_name = image_root_path.name
+				# Avoid creating paths like data/data/... when image already starts with data/.
+				if not image_path.parts or image_path.parts[0] != root_name:
+					search_candidates.append(image_root_path / image_path)
+
+			repo_root = Path(__file__).resolve().parents[4]
+			search_candidates.append(repo_root / image_path)
+			if image_root is not None and (not image_path.parts or image_path.parts[0] != root_name):
+				search_candidates.append(repo_root / Path(image_root) / image_path)
+
+			for candidate in search_candidates:
+				if candidate.exists():
+					image_path = candidate
+					break
 		if not image_path.exists():
 			raise FileNotFoundError(f"Image not found: {image_path}")
 		pil_image = Image.open(image_path)
