@@ -7,11 +7,12 @@ from src.chain.types import RerankedRecord
 
 def evaluate_cirr_chain_records(
 	records: Sequence[RerankedRecord],
-	k_values: Sequence[int] = (1, 5, 10, 50),
+	k_values: Sequence[int] = (1, 5, 10, 15),
 	latency_stats: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
 	"""Evaluate CIRR chain reranking records on recall and coverage metrics."""
 	hits = {int(k): 0 for k in k_values}
+	retrieval_hits = {int(k): 0 for k in k_values}
 	eligible = {int(k): 0 for k in k_values}
 
 	num_queries = len(records)
@@ -36,11 +37,15 @@ def evaluate_cirr_chain_records(
 			coverage_hits += 1
 
 		ranked_ids = [item.candidate_id for item in record.candidates]
+		source_rank = record.metadata.get("target_rank_in_source_top_n")
+		source_rank_int = int(source_rank) if source_rank is not None else None
 		for k in k_values:
 			k_int = int(k)
 			if len(ranked_ids) < k_int:
 				continue
 			eligible[k_int] += 1
+			if source_rank_int is not None and source_rank_int <= k_int:
+				retrieval_hits[k_int] += 1
 			if target_name in ranked_ids[:k_int]:
 				hits[k_int] += 1
 
@@ -54,10 +59,13 @@ def evaluate_cirr_chain_records(
 
 	for k in k_values:
 		k_int = int(k)
+		retrieval_name = f"retrieval_recall_at{k_int}"
 		name = f"chain_recall_at{k_int}"
 		if eligible[k_int] == 0:
+			metrics[retrieval_name] = float("nan")
 			metrics[name] = float("nan")
 		else:
+			metrics[retrieval_name] = float((retrieval_hits[k_int] / eligible[k_int]) * 100.0)
 			metrics[name] = float((hits[k_int] / eligible[k_int]) * 100.0)
 
 	if latency_stats is not None:

@@ -105,6 +105,14 @@ def rerank_candidate_records(
 		source_candidates = list(record.candidates[:rerank_top_n])
 		total_source_candidates += len(record.candidates)
 
+		target_in_source_top_n: bool | None = None
+		target_rank_in_source_top_n: int | None = None
+		if query.target_name is not None:
+			source_ids = [item.candidate_id for item in source_candidates]
+			target_in_source_top_n = query.target_name in source_ids
+			if target_in_source_top_n:
+				target_rank_in_source_top_n = source_ids.index(query.target_name) + 1
+
 		reference_image = resolver.resolve_reference_image(record)
 		rerank_query = RerankQuery(
 			reference_image=reference_image,
@@ -198,8 +206,11 @@ def rerank_candidate_records(
 					"query_latency_seconds": float(query_elapsed),
 					"scored_pairs": float(len(candidate_items)),
 					"source_candidate_count": float(len(record.candidates)),
+					"source_rerank_pool_size": float(len(source_candidates)),
 					"target_in_source_top_m": record.target_in_top_m,
 					"target_rank_in_source_top_m": record.target_rank_in_top_m,
+					"target_in_source_top_n": target_in_source_top_n,
+					"target_rank_in_source_top_n": target_rank_in_source_top_n,
 					"retriever_top_m": float(record.retriever_top_m),
 					"fuse_with_retrieval_scores": bool(fuse_with_retrieval_scores),
 					"retrieval_score_weight": float(retrieval_score_weight),

@@ -19,6 +19,7 @@ runtime:
 
 chain:
   top_m: 100
+  k_values: [1, 5, 10, 15]
   max_queries: null
 
 stage_b:
@@ -27,6 +28,7 @@ stage_b:
   cirr_candidates_file: ""
   fashioniq_candidates_file: ""
   rerank_top_n: 100
+  k_values: [1, 5, 10, 15]
   fuse_with_retrieval_scores: false
   retrieval_score_weight: 0.0
   reranker_score_weight: 1.0

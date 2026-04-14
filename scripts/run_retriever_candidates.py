@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.chain.candidate_io import load_candidate_records, save_candidate_records
 from src.chain.cirr_chain import build_cirr_candidate_records
 from src.chain.fashioniq_chain import build_fashioniq_candidate_records
+from src.chain.types import CandidateListRecord
 from src.retrievers.base import TwoEncoderVLM
 from src.utils.io import save_to_csv, save_to_json
 
@@ -157,6 +158,7 @@ def _resolve_runtime_context(args: argparse.Namespace, device: torch.device) -> 
 			"name": "retriever_candidates",
 			"datasets": list(args.datasets),
 			"top_m": int(args.top_m),
+			"k_values": [int(k) for k in args.k_values],
 			"max_queries": args.max_queries,
 			"batch_size": int(args.batch_size),
 			"num_workers": int(args.num_workers),
@@ -183,6 +185,7 @@ def _build_protocol_summary(args: argparse.Namespace) -> dict[str, Any]:
 		"validated": True,
 		"mode": "stage_a_retriever_candidates",
 		"candidate_depth": int(args.top_m),
+		"k_values": [int(k) for k in args.k_values],
 		"reference_removed": True,
 		"datasets": {},
 	}
@@ -192,7 +195,10 @@ def _build_protocol_summary(args: argparse.Namespace) -> dict[str, Any]:
 			"split": args.cirr_split,
 			"candidate_pool": "retriever top-m from full validation gallery, reference removed",
 			"query_id": "cirr:{split}:{pair_id}",
-			"metrics_ready_for_chain": ["coverage@M", "rerank_recall_at1", "rerank_recall_at5", "rerank_recall_at10", "rerank_recall_at50"],
+			"metrics_ready_for_chain": [
+				"coverage@M",
+				*[f"retrieval_recall_at{k}" for k in args.k_values],
+			],
 		}
 
 	if "fashioniq" in args.datasets:
@@ -202,7 +208,10 @@ def _build_protocol_summary(args: argparse.Namespace) -> dict[str, Any]:
 			"eval_protocol": args.fashioniq_eval_protocol,
 			"candidate_pool": "retriever top-m from class-specific gallery, reference removed",
 			"query_id": "fashioniq:{split}:{class}:{index}",
-			"metrics_ready_for_chain": ["coverage@M", "rerank_recall_at5", "rerank_recall_at10", "rerank_recall_at50"],
+			"metrics_ready_for_chain": [
+				"coverage@M",
+				*[f"retrieval_recall_at{k}" for k in args.k_values],
+			],
 		}
 
 	return summary
@@ -231,6 +240,8 @@ def _merge_args_with_config(args: argparse.Namespace, config: dict[str, Any]) ->
 
 	if args.top_m <= 0:
 		args.top_m = int(chain_cfg.get("top_m", 100))
+	if not args.k_values:
+		args.k_values = [int(k) for k in chain_cfg.get("k_values", [1, 5, 10, 15])]
 	if args.max_queries is None:
 		args.max_queries = chain_cfg.get("max_queries")
 
@@ -267,8 +278,103 @@ def _merge_args_with_config(args: argparse.Namespace, config: dict[str, Any]) ->
 
 	if not args.model_name_or_path:
 		raise ValueError("model_name_or_path must be provided either via CLI or config.retriever.model_name_or_path")
+	if not args.k_values:
+		raise ValueError("k_values must contain at least one integer cutoff.")
+	if any(int(k) <= 0 for k in args.k_values):
+		raise ValueError("k_values must be positive integers.")
 
 	return args
+
+
+def _compute_cirr_retrieval_metrics(records: list[CandidateListRecord], k_values: list[int]) -> dict[str, float]:
+	hits = {int(k): 0 for k in k_values}
+	eligible = {int(k): 0 for k in k_values}
+	queries_with_target = 0
+
+	for record in records:
+		target_name = record.query.target_name
+		if target_name is None:
+			continue
+		queries_with_target += 1
+		candidate_ids = [item.candidate_id for item in record.candidates]
+		for k in k_values:
+			k_int = int(k)
+			if len(candidate_ids) < k_int:
+				continue
+			eligible[k_int] += 1
+			if target_name in candidate_ids[:k_int]:
+				hits[k_int] += 1
+
+	metrics: dict[str, float] = {
+		"num_queries_with_target": float(queries_with_target),
+	}
+	for k in k_values:
+		k_int = int(k)
+		key = f"retrieval_recall_at{k_int}"
+		if eligible[k_int] == 0:
+			metrics[key] = float("nan")
+		else:
+			metrics[key] = float((hits[k_int] / eligible[k_int]) * 100.0)
+	return metrics
+
+
+def _compute_fashioniq_retrieval_metrics(
+	records: list[CandidateListRecord],
+	k_values: list[int],
+	metric_prefix: str,
+) -> dict[str, float]:
+	classes = sorted({str(record.query.query_class) for record in records if record.query.query_class})
+	if not classes:
+		classes = ["dress", "shirt", "toptee"]
+
+	hits = {cls: {int(k): 0 for k in k_values} for cls in classes}
+	eligible = {cls: {int(k): 0 for k in k_values} for cls in classes}
+	class_queries = {cls: 0 for cls in classes}
+
+	for record in records:
+		target_name = record.query.target_name
+		query_class = str(record.query.query_class) if record.query.query_class else "unknown"
+		if query_class not in class_queries:
+			class_queries[query_class] = 0
+			hits[query_class] = {int(k): 0 for k in k_values}
+			eligible[query_class] = {int(k): 0 for k in k_values}
+
+		if target_name is None:
+			continue
+		class_queries[query_class] += 1
+		candidate_ids = [item.candidate_id for item in record.candidates]
+		for k in k_values:
+			k_int = int(k)
+			if len(candidate_ids) < k_int:
+				continue
+			eligible[query_class][k_int] += 1
+			if target_name in candidate_ids[:k_int]:
+				hits[query_class][k_int] += 1
+
+	metrics: dict[str, float] = {
+		"num_queries_with_target": float(sum(class_queries.values())),
+	}
+
+	for cls in sorted(class_queries.keys()):
+		for k in k_values:
+			k_int = int(k)
+			key = f"{metric_prefix}_{cls}_retrieval_recall_at{k_int}"
+			if eligible[cls][k_int] == 0:
+				metrics[key] = float("nan")
+			else:
+				metrics[key] = float((hits[cls][k_int] / eligible[cls][k_int]) * 100.0)
+
+	for k in k_values:
+		k_int = int(k)
+		values = [
+			metrics[f"{metric_prefix}_{cls}_retrieval_recall_at{k_int}"]
+			for cls in sorted(class_queries.keys())
+			if f"{metric_prefix}_{cls}_retrieval_recall_at{k_int}" in metrics
+		]
+		valid = [value for value in values if value == value]
+		metrics[f"{metric_prefix}_avg_retrieval_recall_at{k_int}"] = float(sum(valid) / max(1, len(valid)))
+
+	return metrics
 
 
 def main() -> None:
@@ -289,6 +395,7 @@ def main() -> None:
 	parser.add_argument("--fashioniq_caption_order_mode", type=str, default="", choices=["original", "both"], help="FashionIQ caption order mode.")
 
 	parser.add_argument("--top_m", type=int, default=-1, help="Retriever top-M depth to save for each query.")
+	parser.add_argument("--k_values", nargs="+", type=int, default=[], help="Recall@K cutoffs to report for Stage A retrieval metrics.")
 	parser.add_argument("--max_queries", type=int, default=None, help="Optional cap on number of queries per dataset.")
 	parser.add_argument("--batch_size", type=int, default=-1, help="Evaluation batch size.")
 	parser.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers.")
@@ -350,6 +457,8 @@ def main() -> None:
 
 		candidate_file_map["cirr"] = "cirr_candidates.jsonl"
 		summary_metrics.update({f"cirr_{k}": float(v) for k, v in cirr_stats.items()})
+		cirr_recall_metrics = _compute_cirr_retrieval_metrics(cirr_records, [int(k) for k in args.k_values])
+		summary_metrics.update({f"cirr_{k}": float(v) for k, v in cirr_recall_metrics.items()})
 
 	if "fashioniq" in args.datasets:
 		fashioniq_records, fashioniq_stats = build_fashioniq_candidate_records(
@@ -373,6 +482,13 @@ def main() -> None:
 
 		candidate_file_map["fashioniq"] = "fashioniq_candidates.jsonl"
 		summary_metrics.update({f"fashioniq_{k}": float(v) for k, v in fashioniq_stats.items()})
+		metric_prefix = "original" if args.fashioniq_eval_protocol == "original_split" else "val"
+		fashioniq_recall_metrics = _compute_fashioniq_retrieval_metrics(
+			fashioniq_records,
+			[int(k) for k in args.k_values],
+			metric_prefix=metric_prefix,
+		)
+		summary_metrics.update({f"fashioniq_{k}": float(v) for k, v in fashioniq_recall_metrics.items()})
 
 	runtime_context = _resolve_runtime_context(args=args, device=device)
 	runtime_context["stage"]["fashioniq_caption_joiner_mode_effective"] = effective_joiner_mode

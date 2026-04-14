@@ -75,6 +75,8 @@ def _merge_args_with_config(args: argparse.Namespace, config: dict[str, Any]) ->
 	if args.rerank_top_n <= 0:
 		default_top_n = stage_b_cfg.get("rerank_top_n", chain_cfg.get("top_m", 100))
 		args.rerank_top_n = int(default_top_n)
+	if not args.k_values:
+		args.k_values = [int(k) for k in stage_b_cfg.get("k_values", chain_cfg.get("k_values", [1, 5, 10, 15]))]
 
 	fuse_default = bool(stage_b_cfg.get("fuse_with_retrieval_scores", False))
 	args.fuse_with_retrieval_scores = _as_bool_or_default(args.fuse_with_retrieval_scores, fuse_default)
@@ -98,6 +100,11 @@ def _merge_args_with_config(args: argparse.Namespace, config: dict[str, Any]) ->
 		args.output_path = str(outputs_cfg.get("root_dir", "results"))
 	if not args.run_name:
 		args.run_name = str(outputs_cfg.get("stage_b_run_name", f"chain_rerank_top{args.rerank_top_n}"))
+
+	if not args.k_values:
+		raise ValueError("k_values must contain at least one integer cutoff.")
+	if any(int(k) <= 0 for k in args.k_values):
+		raise ValueError("k_values must be positive integers.")
 
 	return args
 
@@ -172,6 +179,7 @@ def _build_runtime_context(
 			"name": "chain_rerank",
 			"datasets": list(args.datasets),
 			"rerank_top_n": int(args.rerank_top_n),
+			"k_values": [int(k) for k in args.k_values],
 			"max_queries": args.max_queries,
 			"fuse_with_retrieval_scores": bool(args.fuse_with_retrieval_scores),
 			"retrieval_score_weight": float(args.retrieval_score_weight),
@@ -236,7 +244,7 @@ def _build_structured_metrics(
 			remainder = full_metric_name.removeprefix("cirr_")
 			split, _, metric = remainder.partition("_")
 			protocol["split"] = split
-			if metric.startswith("chain_recall_at"):
+			if metric.startswith("chain_recall_at") or metric.startswith("retrieval_recall_at"):
 				protocol["score_type"] = "dataset_level"
 			elif metric == "target_coverage_at_m":
 				protocol["score_type"] = "upper_bound"
@@ -258,9 +266,9 @@ def _build_structured_metrics(
 				metric = metric.removeprefix("original_")
 			protocol["split"] = split
 
-			if metric.startswith("avg_chain_recall_at"):
+			if metric.startswith("avg_chain_recall_at") or metric.startswith("avg_retrieval_recall_at"):
 				protocol["score_type"] = "macro_average"
-			elif metric.endswith("chain_recall_at5") or metric.endswith("chain_recall_at10") or metric.endswith("chain_recall_at50"):
+			elif "_chain_recall_at" in metric or "_retrieval_recall_at" in metric:
 				protocol["score_type"] = "dataset_level"
 			elif "coverage" in metric:
 				protocol["score_type"] = "upper_bound"
@@ -291,6 +299,7 @@ def _build_protocol_summary(args: argparse.Namespace, runtime_context: dict[str,
 		"datasets": list(args.datasets),
 		"candidate_files": runtime_context["stage"]["candidate_files"],
 		"rerank_top_n": int(args.rerank_top_n),
+		"k_values": [int(k) for k in args.k_values],
 		"fuse_with_retrieval_scores": bool(args.fuse_with_retrieval_scores),
 		"retrieval_score_weight": float(args.retrieval_score_weight),
 		"reranker_score_weight": float(args.reranker_score_weight),
@@ -314,6 +323,7 @@ def main() -> None:
 
 	parser.add_argument("--reranker_config", type=str, default="", help="LamRA reranker config file path.")
 	parser.add_argument("--rerank_top_n", type=int, default=-1, help="Top-N candidates to rerank per query.")
+	parser.add_argument("--k_values", nargs="+", type=int, default=[], help="Recall@K cutoffs to report before/after rerank.")
 	parser.add_argument("--max_queries", type=int, default=None, help="Optional cap per dataset for debug/smoke runs.")
 
 	parser.add_argument("--fuse_with_retrieval_scores", type=str, default="", choices=["", "true", "false"], help="Fuse retrieval and reranker scores.")
@@ -343,6 +353,18 @@ def main() -> None:
 		if args.max_queries is not None:
 			candidate_records = candidate_records[: args.max_queries]
 
+		short_records = [
+			record.query.query_id
+			for record in candidate_records
+			if len(record.candidates) < int(args.rerank_top_n)
+		]
+		if short_records:
+			preview = ", ".join(short_records[:3])
+			raise ValueError(
+				"rerank_top_n exceeds available Stage-A candidates for one or more queries. "
+				f"rerank_top_n={args.rerank_top_n}, first query_ids: {preview}"
+			)
+
 		reranked_records, latency_stats = rerank_candidate_records(
 			reranker=reranker,
 			records=candidate_records,
@@ -354,7 +376,11 @@ def main() -> None:
 		)
 
 		if dataset == "cirr":
-			raw_metrics = evaluate_cirr_chain_records(reranked_records, latency_stats=latency_stats)
+			raw_metrics = evaluate_cirr_chain_records(
+				reranked_records,
+				k_values=tuple(int(k) for k in args.k_values),
+				latency_stats=latency_stats,
+			)
 			record_split = reranked_records[0].query.split if reranked_records else "val"
 		elif dataset == "fashioniq":
 			record_split = reranked_records[0].query.split if reranked_records else "val"
@@ -362,6 +388,7 @@ def main() -> None:
 			raw_metrics = evaluate_fashioniq_chain_records(
 				reranked_records,
 				metric_prefix=metric_prefix,
+				k_values=tuple(int(k) for k in args.k_values),
 				latency_stats=latency_stats,
 			)
 		else:
