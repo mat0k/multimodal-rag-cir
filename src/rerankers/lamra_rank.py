@@ -50,6 +50,7 @@ class LamRARanker(BaseReranker):
 		resize_short_edge: int | None = None,
 		center_crop: int | None = None,
 		interpolation: str = "bicubic",
+		candidate_batch_size: int = 1,
 	) -> None:
 		self.model_name_or_path = model_name_or_path
 		self.device = self._resolve_device(device)
@@ -64,11 +65,14 @@ class LamRARanker(BaseReranker):
 		self.resize_short_edge = resize_short_edge
 		self.center_crop = center_crop
 		self.interpolation = interpolation
+		self.candidate_batch_size = max(1, int(candidate_batch_size))
 
 		self.model: Qwen2_5_VLForConditionalGeneration | None = None
 		self.processor: Any = None
 		self.tokenizer: Any = None
 		self.emb_token_id: int | None = None
+		self.yes_token_id: int | None = None
+		self.no_token_id: int | None = None
 
 		self.load_model()
 
@@ -83,6 +87,7 @@ class LamRARanker(BaseReranker):
 		model_cfg = dict(config_data.get("model", {}))
 		runtime_cfg = dict(config_data.get("runtime", {}))
 		image_cfg = dict(config_data.get("image_io", {}))
+		inference_cfg = dict(config_data.get("inference", {}))
 
 		model_name_or_path = (
 			model_cfg.get("checkpoint_path")
@@ -112,6 +117,7 @@ class LamRARanker(BaseReranker):
 				else None
 			),
 			interpolation=str(image_cfg.get("interpolation", "bicubic")),
+			candidate_batch_size=int(inference_cfg.get("batch_size_candidates", 1)),
 		)
 
 	def load_model(self) -> None:
@@ -133,6 +139,35 @@ class LamRARanker(BaseReranker):
 		self.model.eval()
 
 		self.emb_token_id = self._ensure_embed_token(self.emb_token)
+		self.yes_token_id = self._get_single_token_id(" yes")
+		self.no_token_id = self._get_single_token_id(" no")
+
+	def _score_messages(self, joint_messages: Sequence[Sequence[dict[str, Any]]]) -> list[float]:
+		if self.model is None or self.processor is None or self.emb_token_id is None:
+			raise RuntimeError("LamRARanker is not initialized. Call load_model() first.")
+		if self.yes_token_id is None or self.no_token_id is None:
+			raise RuntimeError("LamRARanker token ids are not initialized. Call load_model() first.")
+
+		model_device = next(self.model.parameters()).device
+		joint_inputs = process_messages_to_inputs(
+			processor=self.processor,
+			messages=joint_messages,
+			device=self.device,
+			move_to_device=False,
+		)
+		joint_inputs = joint_inputs.to(model_device)
+
+		with torch.inference_mode():
+			logits = self.model(
+				**joint_inputs,
+				return_dict=True,
+			).logits
+			next_token_logits = logits[:, -1, :]
+			yes_logit = next_token_logits[:, self.yes_token_id]
+			no_logit = next_token_logits[:, self.no_token_id]
+			binary_logits = torch.stack([no_logit, yes_logit], dim=1)
+			prob_yes = torch.softmax(binary_logits, dim=1)[:, 1]
+		return prob_yes.detach().float().cpu().tolist()
 
 	@staticmethod
 	def _ensure_chat_template(processor: Qwen2_5_VLProcessor, model_name_or_path: str) -> None:
@@ -261,7 +296,6 @@ class LamRARanker(BaseReranker):
 		"""
 		if self.model is None or self.processor is None or self.emb_token_id is None:
 			raise RuntimeError("LamRARanker is not initialized. Call load_model() first.")
-		model_device = next(self.model.parameters()).device
 
 		reference_image = load_image_item(
 			query.reference_image,
@@ -279,41 +313,52 @@ class LamRARanker(BaseReranker):
 			center_crop=self.center_crop,
 			interpolation=self.interpolation,
 		)
-		joint_messages = [
-			build_pointwise_relevance_message(
-				reference_image=reference_image,
-				text_edit=query.text_edit,
-				candidate_image=candidate_image,
-			)
-		]
-
-		joint_inputs = process_messages_to_inputs(
-			processor=self.processor,
-			messages=joint_messages,
-			device=self.device,
-			move_to_device=False,
+		joint_message = build_pointwise_relevance_message(
+			reference_image=reference_image,
+			text_edit=query.text_edit,
+			candidate_image=candidate_image,
 		)
-
-		joint_inputs = joint_inputs.to(model_device)
-
-		yes_token_id = self._get_single_token_id(" yes")
-		no_token_id = self._get_single_token_id(" no")
-
-		with torch.no_grad():
-			logits = self.model(
-				**joint_inputs,
-				return_dict=True,
-			).logits
-			next_token_logits = logits[:, -1, :]
-			yes_logit = next_token_logits[:, yes_token_id]
-			no_logit = next_token_logits[:, no_token_id]
-			binary_logits = torch.stack([no_logit, yes_logit], dim=1)
-			prob_yes = torch.softmax(binary_logits, dim=1)[:, 1]
-		return float(prob_yes.item())
+		return float(self._score_messages([joint_message])[0])
 
 	def score_batch(self, query: RerankQuery, candidates: Sequence[RerankCandidate]) -> list[float]:
 		"""Return continuous relevance scores aligned with input candidate order."""
-		return [self.score(query=query, candidate=candidate) for candidate in candidates]
+		if not candidates:
+			return []
+		if self.model is None or self.processor is None or self.emb_token_id is None:
+			raise RuntimeError("LamRARanker is not initialized. Call load_model() first.")
+
+		reference_image = load_image_item(
+			query.reference_image,
+			image_root=self.image_root,
+			rgb_only=self.rgb_only,
+			resize_short_edge=self.resize_short_edge,
+			center_crop=self.center_crop,
+			interpolation=self.interpolation,
+		)
+
+		scores: list[float] = []
+		for start in range(0, len(candidates), self.candidate_batch_size):
+			chunk = candidates[start:start + self.candidate_batch_size]
+			joint_messages: list[Sequence[dict[str, Any]]] = []
+			for candidate in chunk:
+				candidate_image = load_image_item(
+					candidate.image,
+					image_root=self.image_root,
+					rgb_only=self.rgb_only,
+					resize_short_edge=self.resize_short_edge,
+					center_crop=self.center_crop,
+					interpolation=self.interpolation,
+				)
+				joint_messages.append(
+					build_pointwise_relevance_message(
+						reference_image=reference_image,
+						text_edit=query.text_edit,
+						candidate_image=candidate_image,
+					)
+				)
+			scores.extend(self._score_messages(joint_messages))
+
+		return scores
 
 	@staticmethod
 	def _load_config_file(config_path: str) -> dict[str, Any]:
