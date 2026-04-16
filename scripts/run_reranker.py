@@ -9,7 +9,9 @@ import torch
 
 from src.evaluation.cirr_rerank_eval import evaluate_cirr_standalone_rerank
 from src.evaluation.fashioniq_rerank_eval import evaluate_fashioniq_standalone_rerank
+from src.rerankers.base import BaseReranker
 from src.rerankers.lamra_rank import LamRARanker
+from src.rerankers.qwen3vl_rank import Qwen3VLReranker
 from src.utils.io import prepend_key_to_dict, save_records_to_csv, save_to_csv, save_to_json
 
 
@@ -45,7 +47,7 @@ def resolve_dataset_name(config: dict[str, Any], dataset_override: str | None) -
 
 def run_standalone_evaluation(
 	dataset: str,
-	reranker: LamRARanker,
+	reranker: BaseReranker,
 	config: dict[str, Any],
 ) -> dict[str, float]:
 	pipeline_cfg = config.get("pipeline", {})
@@ -58,7 +60,10 @@ def run_standalone_evaluation(
 	candidate_cfg = config.get("standalone_candidate_pool", {})
 	num_random_distractors = int(candidate_cfg.get("num_random_negatives", 31))
 	seed = int(config.get("seed", 42))
-	use_tqdm = bool(config.get("runtime", {}).get("tqdm", False))
+	runtime_cfg = config.get("runtime", {})
+	use_tqdm = bool(runtime_cfg.get("tqdm", False))
+	max_queries_value = runtime_cfg.get("max_queries", 0)
+	max_queries = int(max_queries_value) if int(max_queries_value) > 0 else None
 
 	if dataset == "cirr":
 		cirr_cfg = config.get("datasets", {}).get("cirr", {})
@@ -68,6 +73,7 @@ def run_standalone_evaluation(
 			reranker=reranker,
 			split=split,
 			num_random_distractors=num_random_distractors,
+			max_queries=max_queries,
 			seed=seed,
 			k_values=k_values,
 			use_tqdm=use_tqdm,
@@ -90,12 +96,46 @@ def run_standalone_evaluation(
 			caption_joiner=caption_joiner,
 			metric_prefix=metric_prefix,
 			num_random_distractors=num_random_distractors,
+			max_queries=max_queries,
 			seed=seed,
 			k_values=k_values,
 			use_tqdm=use_tqdm,
 		)
 
 	raise ValueError(f"Unsupported dataset '{dataset}'. Supported: cirr, fashioniq.")
+
+
+def resolve_reranker_type(config: dict[str, Any]) -> str:
+	reranker_cfg = config.get("reranker", {})
+	raw_type = str(reranker_cfg.get("type", "")).strip().lower()
+	if raw_type:
+		return raw_type
+
+	model_name = str(config.get("model", {}).get("name", "")).lower()
+	if "qwen3-vl-reranker" in model_name or "qwen3vl" in model_name:
+		return "qwen3vl"
+	return "lamra"
+
+
+def build_reranker(config: dict[str, Any]) -> BaseReranker:
+	reranker_type = resolve_reranker_type(config)
+
+	if reranker_type in {"lamra", "lamra_rank", "lamra-rank"}:
+		return LamRARanker.from_config(config)
+
+	if reranker_type in {
+		"qwen3vl",
+		"qwen3_vl",
+		"qwen3-vl",
+		"qwen3vl-reranker",
+		"qwen3-vl-reranker",
+	}:
+		return Qwen3VLReranker.from_config(config)
+
+	raise ValueError(
+		f"Unsupported reranker type '{reranker_type}'. "
+		"Supported types: lamra, qwen3vl."
+	)
 
 
 def build_runtime_context(
@@ -152,6 +192,7 @@ def build_runtime_context(
 			"output_dir": run_output_dir,
 		},
 		"model": {
+			"reranker_type": resolve_reranker_type(config),
 			"name": model_cfg.get("name"),
 			"model_name_or_path": model_cfg.get("model_name_or_path"),
 			"revision": model_cfg.get("revision"),
@@ -341,7 +382,7 @@ def select_main_metrics(dataset: str, metrics: dict[str, float]) -> dict[str, fl
 
 
 def main() -> None:
-	parser = argparse.ArgumentParser(description="Run standalone LamRA reranker evaluation.")
+	parser = argparse.ArgumentParser(description="Run standalone reranker evaluation.")
 	parser.add_argument("--config", type=str, default="configs/reranker/lamra_rank.yaml", help="Path to reranker YAML config.")
 	parser.add_argument("--dataset", type=str, default="", choices=["cirr", "fashioniq"], help="Dataset override. If omitted, inferred from config enabled datasets.")
 	parser.add_argument("--output_dir", type=str, default="", help="Optional output directory override.")
@@ -355,7 +396,7 @@ def main() -> None:
 	run_output_dir = os.path.join(root_output_dir, run_name)
 	os.makedirs(run_output_dir, exist_ok=True)
 
-	reranker = LamRARanker.from_config(args.config)
+	reranker = build_reranker(config)
 	metrics_raw = run_standalone_evaluation(dataset=dataset, reranker=reranker, config=config)
 	metrics = build_prefixed_metrics(dataset=dataset, metrics=metrics_raw)
 
