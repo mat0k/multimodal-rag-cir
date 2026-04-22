@@ -26,7 +26,7 @@ from src.chain.fashioniq_chain import build_fashioniq_candidate_records
 from src.chain.pipeline import rerank_candidate_records
 from src.evaluation.cirr_chain_eval import evaluate_cirr_chain_records
 from src.evaluation.fashioniq_chain_eval import evaluate_fashioniq_chain_records
-from src.rerankers.lamra_rank import LamRARanker
+from src.rerankers.factory import build_reranker_from_config
 from src.retrievers.base import TwoEncoderVLM
 from src.utils.io import save_to_json
 
@@ -130,7 +130,7 @@ def _assert_coverage_present(metrics: dict[str, float], dataset: str) -> None:
 
 def main() -> None:
 	parser = argparse.ArgumentParser(description="Tiny end-to-end chain sanity check (Stage A + Stage B).")
-	parser.add_argument("--config", type=str, default="configs/chain/vista_lamra_chain.yaml", help="Chain config path.")
+	parser.add_argument("--config", type=str, default="configs/chain/vista_qwen3vl_chain.yaml", help="Chain config path.")
 	parser.add_argument("--datasets", nargs="+", default=["cirr", "fashioniq"], choices=["cirr", "fashioniq"], help="Datasets to sanity-check.")
 	parser.add_argument("--top_m", type=int, default=20, help="Retriever top-M candidates for sanity run.")
 	parser.add_argument("--rerank_top_n", type=int, default=20, help="Rerank top-N candidates for sanity run.")
@@ -175,8 +175,8 @@ def main() -> None:
 		device=device,
 		init_kwargs=init_kwargs,
 	)
-	reranker_cfg = str(stage_b_cfg.get("reranker_config", "configs/reranker/lamra_rank.yaml"))
-	reranker = LamRARanker.from_config(reranker_cfg)
+	reranker_cfg = str(stage_b_cfg.get("reranker_config", "configs/reranker/qwen3vl_reranker_2b.yaml"))
+	reranker = build_reranker_from_config(reranker_cfg)
 
 	os.makedirs(args.output_dir, exist_ok=True)
 

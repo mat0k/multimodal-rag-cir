@@ -379,7 +379,7 @@ def _compute_fashioniq_retrieval_metrics(
 
 def main() -> None:
 	parser = argparse.ArgumentParser(description="Generate Stage-A retriever top-M candidate lists for chain reranking.")
-	parser.add_argument("--config", type=str, default="configs/chain/vista_lamra_chain.yaml", help="Path to chain YAML config.")
+	parser.add_argument("--config", type=str, default="configs/chain/vista_qwen3vl_chain.yaml", help="Path to chain YAML config.")
 
 	parser.add_argument("--model_name_or_path", type=str, default="", help="Base model name or local path.")
 	parser.add_argument("--retriever_module", type=str, default="", help="Python module containing retriever class.")

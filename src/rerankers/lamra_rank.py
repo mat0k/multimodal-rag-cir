@@ -34,6 +34,7 @@ class LamRARanker(BaseReranker):
 	- two-stage reranking on retriever top-k
 	- teacher scoring in distillation pipelines
 	"""
+	reranker_type = "lamra"
 
 	def __init__(
 		self,

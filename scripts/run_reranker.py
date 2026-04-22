@@ -2,14 +2,20 @@ import argparse
 from datetime import datetime, timezone
 import os
 import platform
+from pathlib import Path
 import sys
 from typing import Any
 
 import torch
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+	sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.evaluation.cirr_rerank_eval import evaluate_cirr_standalone_rerank
 from src.evaluation.fashioniq_rerank_eval import evaluate_fashioniq_standalone_rerank
-from src.rerankers.lamra_rank import LamRARanker
+from src.rerankers.base import BaseReranker
+from src.rerankers.factory import build_reranker_from_config
 from src.utils.io import prepend_key_to_dict, save_records_to_csv, save_to_csv, save_to_json
 
 
@@ -45,7 +51,7 @@ def resolve_dataset_name(config: dict[str, Any], dataset_override: str | None) -
 
 def run_standalone_evaluation(
 	dataset: str,
-	reranker: LamRARanker,
+	reranker: BaseReranker,
 	config: dict[str, Any],
 ) -> dict[str, float]:
 	pipeline_cfg = config.get("pipeline", {})
@@ -341,8 +347,8 @@ def select_main_metrics(dataset: str, metrics: dict[str, float]) -> dict[str, fl
 
 
 def main() -> None:
-	parser = argparse.ArgumentParser(description="Run standalone LamRA reranker evaluation.")
-	parser.add_argument("--config", type=str, default="configs/reranker/lamra_rank.yaml", help="Path to reranker YAML config.")
+	parser = argparse.ArgumentParser(description="Run standalone reranker evaluation.")
+	parser.add_argument("--config", type=str, default="configs/reranker/qwen3vl_reranker_2b.yaml", help="Path to reranker YAML config.")
 	parser.add_argument("--dataset", type=str, default="", choices=["cirr", "fashioniq"], help="Dataset override. If omitted, inferred from config enabled datasets.")
 	parser.add_argument("--output_dir", type=str, default="", help="Optional output directory override.")
 	args = parser.parse_args()
@@ -351,11 +357,11 @@ def main() -> None:
 	dataset = resolve_dataset_name(config=config, dataset_override=args.dataset or None)
 	outputs_cfg = config.get("outputs", {})
 	root_output_dir = args.output_dir or str(outputs_cfg.get("root_dir", "results"))
-	run_name = f"{config.get('experiment_name', 'lamra-reranker')}-{dataset}-standalone"
+	run_name = f"{config.get('experiment_name', 'qwen3vl-reranker')}-{dataset}-standalone"
 	run_output_dir = os.path.join(root_output_dir, run_name)
 	os.makedirs(run_output_dir, exist_ok=True)
 
-	reranker = LamRARanker.from_config(args.config)
+	reranker = build_reranker_from_config(args.config)
 	metrics_raw = run_standalone_evaluation(dataset=dataset, reranker=reranker, config=config)
 	metrics = build_prefixed_metrics(dataset=dataset, metrics=metrics_raw)
 

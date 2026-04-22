@@ -1,0 +1,107 @@
+version: 1
+experiment_name: qwen3vl-reranker-2b-pool100
+seed: 42
+
+reranker:
+  type: qwen3vl
+
+model:
+  type: qwen3vl
+  name: Qwen3-VL-Reranker-2B
+  checkpoint_path: /nfs/home/maatouk/multimodal-rag-cir/models/Qwen3-VL-Reranker-2B
+  model_name_or_path: /nfs/home/maatouk/multimodal-rag-cir/models/Qwen3-VL-Reranker-2B
+  trust_remote_code: true
+  local_files_only: true
+  revision: main
+
+runtime:
+  device: auto
+  dtype: bfloat16
+  torch_compile: false
+  gradient_checkpointing: false
+
+inference:
+  batch_size_queries: 8
+  batch_size_candidates: 100
+  max_candidate_pool_size: 200
+  normalize_scores: false
+  sort_descending: true
+  return_raw_scores: true
+
+image_io:
+  image_root: data
+  rgb_only: true
+  interpolation: bicubic
+  resize_short_edge: 448
+  center_crop: 448
+  num_image_workers: 4
+  pin_memory: true
+  persistent_workers: false
+
+prompting:
+  template_id: qwen3vl_default_v1
+  max_text_length: 128
+  lowercase_text: false
+  strip_text: true
+
+pipeline:
+  # standalone: target + random negatives
+  # two_stage: retriever top-k reranked by Qwen3-VL 2B
+  mode: standalone
+  rerank_top_k: 100
+  keep_initial_retrieval_scores: true
+  fuse_with_retrieval_scores: false
+  retrieval_score_weight: 0.0
+  reranker_score_weight: 1.0
+
+standalone_candidate_pool:
+  enabled: true
+  include_true_target: true
+  num_random_negatives: 99
+  random_source: split_gallery
+  deduplicate_candidates: true
+  fail_if_target_missing: true
+
+two_stage:
+  enabled: false
+  retriever_run_path: ""
+  retriever_candidates_field: candidate_names
+  retriever_scores_field: candidate_scores
+  retriever_reference_field: reference_name
+  retriever_target_field: target_name
+  remove_reference_from_candidates: true
+
+datasets:
+  cirr:
+    enabled: true
+    split: val
+    subset_metrics: true
+    subset_k_values: [1, 2, 3]
+    global_k_values: [1, 5, 10, 50]
+    caption_joiner: " "
+    max_text_length: 77
+
+  fashioniq:
+    enabled: true
+    eval_protocol: val_split
+    split: val
+    classes: [dress, shirt, toptee]
+    recall_k_values: [5, 10, 50]
+    caption_joiner_val_split: " "
+    caption_joiner_original_split: " and "
+    max_text_length: 77
+
+outputs:
+  root_dir: results
+  save_ranked_candidates: true
+  save_per_query_scores: true
+  save_metrics_csv: true
+  save_metrics_json: true
+  save_runtime_json: true
+
+distillation:
+  enabled: false
+  teacher_score_field: qwen3vl_score
+  student_target_type: pairwise
+  temperature: 1.0
+  margin: 0.0

@@ -18,7 +18,8 @@ from src.chain.candidate_io import load_candidate_records, save_reranked_records
 from src.chain.pipeline import rerank_candidate_records
 from src.evaluation.cirr_chain_eval import evaluate_cirr_chain_records
 from src.evaluation.fashioniq_chain_eval import evaluate_fashioniq_chain_records
-from src.rerankers.lamra_rank import LamRARanker
+from src.rerankers.base import BaseReranker
+from src.rerankers.factory import build_reranker_from_config, resolve_reranker_type
 from src.utils.io import prepend_key_to_dict, save_records_to_csv, save_to_csv, save_to_json
 
 
@@ -87,7 +88,7 @@ def _merge_args_with_config(args: argparse.Namespace, config: dict[str, Any]) ->
 		args.reranker_score_weight = float(stage_b_cfg.get("reranker_score_weight", 1.0))
 
 	if not args.reranker_config:
-		args.reranker_config = str(stage_b_cfg.get("reranker_config", "configs/reranker/lamra_rank.yaml"))
+		args.reranker_config = str(stage_b_cfg.get("reranker_config", "configs/reranker/qwen3vl_reranker_2b.yaml"))
 
 	if not args.candidate_run_dir:
 		args.candidate_run_dir = str(stage_b_cfg.get("candidate_run_dir", ""))
@@ -139,11 +140,17 @@ def _resolve_candidate_file(dataset: str, args: argparse.Namespace) -> str:
 
 def _build_runtime_context(
 	args: argparse.Namespace,
-	reranker: LamRARanker,
+	reranker: BaseReranker,
 	run_output_dir: str,
 	candidate_file_map: dict[str, str],
 ) -> dict[str, Any]:
-	requested_device = str(load_yaml_config(args.reranker_config).get("runtime", {}).get("device", "auto"))
+	reranker_cfg = load_yaml_config(args.reranker_config)
+	requested_device = str(reranker_cfg.get("runtime", {}).get("device", "auto"))
+	reranker_name = str(
+		reranker_cfg.get("model", {}).get("name")
+		or reranker.__class__.__name__
+	)
+	reranker_type = resolve_reranker_type(reranker_cfg)
 	resolved_device = str(reranker.device)
 
 	cuda_available = bool(torch.cuda.is_available())
@@ -189,8 +196,10 @@ def _build_runtime_context(
 		},
 		"reranker": {
 			"config": args.reranker_config,
-			"model_name_or_path": reranker.model_name_or_path,
-			"dtype": str(reranker.dtype),
+			"type": reranker_type,
+			"name": reranker_name,
+			"model_name_or_path": getattr(reranker, "model_name_or_path", None),
+			"dtype": str(getattr(reranker, "dtype", "unknown")),
 		},
 		"run": {
 			"output_dir": run_output_dir,
@@ -220,11 +229,14 @@ def _build_structured_metrics(
 	runtime_summary = {
 		"device": runtime_context["device"]["resolved"],
 		"gpu_name": runtime_context["device"]["cuda_device_name"],
+		"reranker": runtime_context.get("reranker", {}).get("name"),
+		"reranker_type": runtime_context.get("reranker", {}).get("type"),
 		"rerank_top_n": runtime_context["stage"]["rerank_top_n"],
 		"fuse_with_retrieval_scores": runtime_context["stage"]["fuse_with_retrieval_scores"],
 		"retrieval_score_weight": runtime_context["stage"]["retrieval_score_weight"],
 		"reranker_score_weight": runtime_context["stage"]["reranker_score_weight"],
 	}
+	reranker_label = str(runtime_context.get("reranker", {}).get("name") or "stage_b_model")
 
 	for full_metric_name, value in prefixed_metrics.items():
 		dataset = "unknown"
@@ -233,7 +245,7 @@ def _build_structured_metrics(
 		protocol = {
 			"name": "two_stage_chain",
 			"split": split,
-			"candidate_pool": "retriever top-m candidates reranked by LamRA",
+			"candidate_pool": f"retriever top-m candidates reranked by {reranker_label}",
 			"reference_removed": True,
 			"runtime": runtime_summary,
 			"score_type": "dataset_level",
@@ -314,14 +326,14 @@ def _build_protocol_summary(args: argparse.Namespace, runtime_context: dict[str,
 
 def main() -> None:
 	parser = argparse.ArgumentParser(description="Run Stage-B chain reranking over Stage-A candidate files.")
-	parser.add_argument("--config", type=str, default="configs/chain/vista_lamra_chain.yaml", help="Path to chain YAML config.")
+	parser.add_argument("--config", type=str, default="configs/chain/vista_qwen3vl_chain.yaml", help="Path to chain YAML config.")
 	parser.add_argument("--datasets", nargs="+", default=[], choices=["cirr", "fashioniq"], help="Datasets to process.")
 
 	parser.add_argument("--candidate_run_dir", type=str, default="", help="Directory containing cirr_candidates.jsonl/fashioniq_candidates.jsonl")
 	parser.add_argument("--cirr_candidates_file", type=str, default="", help="Explicit CIRR candidates file path.")
 	parser.add_argument("--fashioniq_candidates_file", type=str, default="", help="Explicit FashionIQ candidates file path.")
 
-	parser.add_argument("--reranker_config", type=str, default="", help="LamRA reranker config file path.")
+	parser.add_argument("--reranker_config", type=str, default="", help="Stage-B reranker config file path.")
 	parser.add_argument("--rerank_top_n", type=int, default=-1, help="Top-N candidates to rerank per query.")
 	parser.add_argument("--k_values", nargs="+", type=int, default=[], help="Recall@K cutoffs to report before/after rerank.")
 	parser.add_argument("--max_queries", type=int, default=None, help="Optional cap per dataset for debug/smoke runs.")
@@ -338,7 +350,7 @@ def main() -> None:
 	config = load_yaml_config(args.config)
 	args = _merge_args_with_config(args=args, config=config)
 
-	reranker = LamRARanker.from_config(args.reranker_config)
+	reranker = build_reranker_from_config(args.reranker_config)
 
 	run_output_dir = os.path.join(args.output_path, args.run_name)
 	os.makedirs(run_output_dir, exist_ok=True)

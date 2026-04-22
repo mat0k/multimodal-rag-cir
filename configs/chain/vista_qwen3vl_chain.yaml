@@ -1,0 +1,51 @@
+version: 1
+experiment_name: vista-qwen3vl-chain
+seed: 42
+
+retriever:
+  model_name_or_path: BAAI/bge-base-en-v1.5
+  module: src.retrievers.vista_retriever
+  class: VistaBGERetriever
+  checkpoint_path: models/Visualized_BGE/Visualized_base_en_v1.5.pth
+  init_kwargs: {}
+
+runtime:
+  device: auto
+  batch_size: 64
+  num_workers: 4
+  query_embedding_mode: vista_mm
+  fusion_type: sum
+  tqdm: false
+
+chain:
+  top_m: 100
+  k_values: [1, 5, 10, 15]
+  max_queries: null
+
+stage_b:
+  reranker_config: configs/reranker/qwen3vl_reranker_2b.yaml
+  candidate_run_dir: ""
+  cirr_candidates_file: ""
+  fashioniq_candidates_file: ""
+  rerank_top_n: 100
+  k_values: [1, 5, 10, 15]
+  fuse_with_retrieval_scores: false
+  retrieval_score_weight: 0.0
+  reranker_score_weight: 1.0
+
+datasets:
+  cirr:
+    enabled: true
+    split: val
+
+  fashioniq:
+    enabled: true
+    eval_protocol: val_split
+    study_setting: default
+    caption_joiner_mode: protocol_default
+    caption_order_mode: original
+
+outputs:
+  root_dir: results
+  run_name: retriever_candidates_vista_m100_qwen3vl_chain
+  stage_b_run_name: chain_rerank_vista_qwen3vl_n100
