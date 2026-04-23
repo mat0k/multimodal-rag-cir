@@ -18,7 +18,7 @@ runtime:
   tqdm: false
 
 chain:
-  top_m: 100
+  top_m: 32
   k_values: [1, 5, 10, 15]
   max_queries: null
 
@@ -27,7 +27,7 @@ stage_b:
   candidate_run_dir: ""
   cirr_candidates_file: ""
   fashioniq_candidates_file: ""
-  rerank_top_n: 100
+  rerank_top_n: 32
   k_values: [1, 5, 10, 15]
   fuse_with_retrieval_scores: false
   retrieval_score_weight: 0.0
@@ -47,5 +47,5 @@ datasets:
 
 outputs:
   root_dir: results
-  run_name: retriever_candidates_vista_m100_qwen3vl_chain
-  stage_b_run_name: chain_rerank_vista_qwen3vl_n100
+  run_name: retriever_candidates_vista_m32_qwen3vl_chain
+  stage_b_run_name: chain_rerank_vista_qwen3vl_n32
