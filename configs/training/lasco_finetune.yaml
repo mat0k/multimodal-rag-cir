@@ -1,0 +1,52 @@
+version: 1
+experiment_name: vista-lasco-finetune-contrastive
+seed: 42
+
+# contrastive | distillation
+training_mode: contrastive
+
+model:
+  model_name_or_path: BAAI/bge-base-en-v1.5
+  checkpoint_path: models/Visualized_BGE/Visualized_base_en_v1.5.pth
+  from_pretrained: null   # null = download BGE weights from HF; set to local path if offline
+
+training:
+  epochs: 10
+  batch_size: 32                    # per-GPU; effective = batch_size * gradient_accumulation_steps
+  gradient_accumulation_steps: 4   # effective batch size = 128
+  learning_rate: 2.0e-5
+  weight_decay: 1.0e-2
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  temperature: 0.02                 # InfoNCE temperature (matches VISTA default)
+  precision: bf16                   # bf16 (A100) | fp32
+  num_workers: 8
+  save_every_n_epochs: 5
+  eval_every_n_epochs: 1
+  log_every_n_steps: 200
+
+data:
+  lasco:
+    annotations: data/lasco/lasco_train.json
+    images_dir: data/lasco/images
+
+# ── Distillation placeholders (Setting 2) ─────────────────────────────────
+# Activate by setting training_mode: distillation and filling these fields.
+distillation:
+  soft_labels_path: null            # path to pre-computed reranker scores (JSONL)
+  reranker_config: configs/reranker/qwen3vl_reranker_2b.yaml
+  temperature: 4.0                  # KD temperature for softening distributions
+  alpha: 0.5                        # weight: alpha*KD + (1-alpha)*contrastive
+
+evaluation:
+  datasets: [fashioniq, cirr]
+  batch_size: 64
+  num_workers: 4
+  query_embedding_mode: vista_mm
+  fusion_type: sum
+  fashioniq_eval_protocol: val_split
+  k_values: [1, 5, 10, 15, 50]
+
+outputs:
+  root_dir: results/training
+  run_name: vista_lasco_finetune_contrastive
