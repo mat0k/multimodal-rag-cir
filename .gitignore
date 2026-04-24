@@ -224,7 +224,7 @@ results/
 *.out
 *.err
 logs/
-
+/data/
 # Data images (large binary files — keep only annotations in git)
 data/cirr/images/
 data/fashioniq/images/
