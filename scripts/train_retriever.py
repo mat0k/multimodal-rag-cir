@@ -86,9 +86,22 @@ def build_run_config(cfg: dict, args: argparse.Namespace) -> dict:
         },
         "model": cfg["model"],
         "training": cfg["training"],
+        "freeze": cfg.get("freeze", {"strategy": "full"}),
         "data": cfg["data"],
         "distillation": cfg.get("distillation", {}),
         "evaluation": cfg["evaluation"],
+        "model_training_details": {
+            "backbone": "VISTA — Visualized BGE-base-en-v1.5 + EVA02-CLIP-B-16",
+            "loss_function": "CrossEntropyLoss (InfoNCE with in-batch negatives)",
+            "loss_defined_in": "src/retrievers/backbones/vista/modeling.py :: compute_loss()",
+            "temperature": cfg["training"].get("temperature", 0.02),
+            "effective_batch_size": (
+                cfg["training"]["batch_size"]
+                * cfg["training"]["gradient_accumulation_steps"]
+            ),
+            "freeze_strategy": cfg.get("freeze", {}).get("strategy", "full"),
+            "note_freeze_details": "see freeze_info.json in run output dir for exact layer counts",
+        },
     }
 
 

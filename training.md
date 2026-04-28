@@ -8,9 +8,11 @@
 **Script:** `scripts/train_retriever.py`
 **Job:** `jobs/training/train_retriever_a100.sbatch`
 
-| # | Run name | Epochs | Batch (eff.) | LR | Temp | FashionIQ R@10 | CIRR R@5 | Notes |
-|---|----------|--------|--------------|----|------|----------------|----------|-------|
-| — | baseline (pre-trained VISTA, no fine-tuning) | — | — | — | — | — | — | zero-shot reference |
+| # | Run name | Epochs | Batch (eff.) | LR | Temp | FashionIQ R@10 | CIRR Summary | Notes |
+|---|----------|--------|--------------|----|------|----------------|--------------|-------|
+| — | baseline (pre-trained VISTA, no fine-tuning) | — | — | — | — | TBD (need vista_mm full-gallery run) | TBD | zero-shot reference |
+| 1 | vista_lasco_finetune_contrastive | 10 | 128 | 2e-5 | 0.02 | 9.15 (ep10) / **11.12 (ep1-best)** | 35.09 (ep10) / **38.65 (ep1-best)** | bf16, A100 20GB MIG; full model trained → catastrophic forgetting; best epoch not saved (bug fixed) |
+| 2 | vista_lasco_finetune_contrastive_v2 | 5 | 128 | **1e-6** | 0.02 | — | — | **partial freeze**: only top 3 BGE layers + visual_proj trained (~10% params); fixes forgetting |
 
 ---
 

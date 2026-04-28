@@ -80,7 +80,7 @@ def _build_optimizer_and_scheduler(
     warmup_steps = int(total_steps * tc["warmup_ratio"])
 
     optimizer = AdamW(
-        backbone.parameters(),
+        filter(lambda p: p.requires_grad, backbone.parameters()),
         lr=tc["learning_rate"],
         weight_decay=tc["weight_decay"],
         betas=(0.9, 0.999),
@@ -123,7 +123,7 @@ def _run_eval(backbone: Visualized_BGE, cfg: dict) -> dict[str, float]:
             tqdm=False,
             accelerator=None,
         )
-        metrics.update(prepend_key_to_dict("fashioniq_val_", fiq))
+        metrics.update(prepend_key_to_dict("fashioniq_", fiq))
 
     if "cirr" in ec["datasets"]:
         cirr = evaluate_cirr(
@@ -135,7 +135,7 @@ def _run_eval(backbone: Visualized_BGE, cfg: dict) -> dict[str, float]:
             tqdm=False,
             accelerator=None,
         )
-        metrics.update(prepend_key_to_dict("cirr_val_", cirr))
+        metrics.update(prepend_key_to_dict("cirr_", cirr))
 
     backbone.train()
     return metrics
@@ -180,6 +180,8 @@ class Trainer:
             )
 
         backbone = _build_backbone(self.cfg)
+        freeze_info = self._freeze_layers(backbone)
+        save_to_json(freeze_info, self.output_dir / "freeze_info.json")
         backbone.train()
 
         loader = _build_dataloader(backbone, self.cfg)
@@ -282,6 +284,72 @@ class Trainer:
         avg_loss = total_loss / steps_per_epoch
         logger.info(f"[Epoch {epoch:02d}] avg_loss={avg_loss:.4f}")
         return {"avg_loss": avg_loss}
+
+    def _freeze_layers(self, backbone: Visualized_BGE) -> dict:
+        """
+        Freeze layers according to config freeze.strategy.
+          - full            : train all parameters (v1 behaviour)
+          - top_layers_only : freeze vision encoder + bottom BGE layers,
+                              train top BGE layers + visual_proj only
+        """
+        freeze_cfg = self.cfg.get("freeze", {"strategy": "full"})
+        strategy = freeze_cfg.get("strategy", "full")
+
+        total_params = sum(p.numel() for p in backbone.parameters())
+
+        if strategy == "full":
+            trainable_params = total_params
+            trainable_modules = ["all"]
+            frozen_modules = []
+        elif strategy == "top_layers_only":
+            # Freeze everything first
+            for param in backbone.parameters():
+                param.requires_grad = False
+
+            n_total = len(backbone.bge_encoder.layer)
+            n_freeze = freeze_cfg.get("bge_freeze_bottom_n_layers", 9)
+            n_train = n_total - n_freeze
+
+            # Unfreeze top BGE transformer layers
+            for i in range(n_freeze, n_total):
+                for param in backbone.bge_encoder.layer[i].parameters():
+                    param.requires_grad = True
+
+            # Unfreeze visual_proj (vision-text bridge)
+            for param in backbone.visual_proj.parameters():
+                param.requires_grad = True
+
+            trainable_params = sum(p.numel() for p in backbone.parameters() if p.requires_grad)
+            trainable_modules = [
+                f"bge_encoder.layer[{n_freeze}:{n_total}]  ({n_train} layers)",
+                "visual_proj",
+            ]
+            frozen_modules = [
+                "bge_embeddings",
+                f"bge_encoder.layer[0:{n_freeze}]  ({n_freeze} layers)",
+                "model_visual  (EVA02-CLIP-B-16, full vision encoder)",
+                "bge_pooler",
+            ]
+        else:
+            raise ValueError(f"Unknown freeze strategy: {strategy!r}. Use 'full' or 'top_layers_only'.")
+
+        info = {
+            "strategy": strategy,
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "frozen_params": total_params - trainable_params,
+            "trainable_pct": round(100.0 * trainable_params / total_params, 2),
+            "trainable_modules": trainable_modules,
+            "frozen_modules": frozen_modules,
+            "loss_function": "CrossEntropyLoss (InfoNCE with in-batch negatives)",
+            "loss_defined_in": "src/retrievers/backbones/vista/modeling.py :: compute_loss()",
+            "temperature": self.cfg["training"].get("temperature", 0.02),
+        }
+
+        logger.info(f"Freeze strategy   : {strategy}")
+        logger.info(f"Trainable params  : {trainable_params:,} / {total_params:,}  ({info['trainable_pct']}%)")
+        logger.info(f"Trainable modules : {trainable_modules}")
+        return info
 
     def _save_checkpoint(
         self, backbone: Visualized_BGE, epoch: int, tag: str

@@ -1,0 +1,61 @@
+version: 2
+experiment_name: vista-lasco-finetune-contrastive-v2
+seed: 42
+
+# contrastive | distillation
+training_mode: contrastive
+
+model:
+  model_name_or_path: BAAI/bge-base-en-v1.5
+  checkpoint_path: models/Visualized_BGE/Visualized_base_en_v1.5.pth
+  from_pretrained: null
+
+training:
+  epochs: 5
+  batch_size: 32                    # per-GPU; effective = batch_size * gradient_accumulation_steps
+  gradient_accumulation_steps: 4   # effective batch size = 128
+  learning_rate: 1.0e-6            # 20x lower than v1 (2e-5) — prevents catastrophic forgetting
+  weight_decay: 1.0e-2
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  temperature: 0.02
+  precision: bf16
+  num_workers: 8
+  save_every_n_epochs: 1            # save every epoch (only 5 epochs, all are cheap to keep)
+  eval_every_n_epochs: 1
+  log_every_n_steps: 200
+
+# ── Layer freezing ────────────────────────────────────────────────────────────
+# v1 trained the full model → catastrophic forgetting + domain mismatch = big drop
+# v2 freezes most of the backbone and only trains top BGE layers + projection bridge
+freeze:
+  strategy: top_layers_only         # full | top_layers_only
+  bge_freeze_bottom_n_layers: 9    # freeze layers 0-8 of 12 BGE transformer layers
+                                    # train only layers 9-11 (top 3)
+  # frozen  : bge_embeddings, bge_encoder.layer[0:9], model_visual (EVA02-CLIP), bge_pooler
+  # trainable: bge_encoder.layer[9:12], visual_proj (vision-text bridge)
+
+data:
+  lasco:
+    annotations: data/lasco/lasco_train.json
+    images_dir: data/lasco/images
+
+# ── Distillation placeholders (Setting 2) ─────────────────────────────────────
+distillation:
+  soft_labels_path: null
+  reranker_config: configs/reranker/qwen3vl_reranker_2b.yaml
+  temperature: 4.0
+  alpha: 0.5
+
+evaluation:
+  datasets: [fashioniq, cirr]
+  batch_size: 64
+  num_workers: 4
+  query_embedding_mode: vista_mm
+  fusion_type: sum
+  fashioniq_eval_protocol: val_split
+  k_values: [1, 5, 10, 15, 50]
+
+outputs:
+  root_dir: results/training
+  run_name: vista_lasco_finetune_contrastive_v2
