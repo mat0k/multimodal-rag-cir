@@ -12,14 +12,18 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.lasco import build_lasco_dataset
+from src.datasets.lasco_distill import build_lasco_distill_dataset
+from src.datasets.benchmark_distill import build_benchmark_distill_dataset
 from src.retrievers.backbones.vista.modeling import Visualized_BGE
 from src.retrievers.vista_retriever import VistaImageProcessor
 from src.training.collator import LaSCoCollator
+from src.training.distill_collator import DistillCollator
 from src.utils.io import save_to_json
 
 logger = logging.getLogger(__name__)
@@ -37,6 +41,58 @@ def _build_backbone(cfg: dict) -> Visualized_BGE:
         temperature=cfg["training"].get("temperature", 0.02),
         negatives_cross_device=False,
         from_pretrained=m.get("from_pretrained"),
+    )
+
+
+def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader:
+    tc = cfg["training"]
+    data_cfg = cfg["data"]
+
+    image_transform = VistaImageProcessor(backbone.preprocess_train)
+
+    def tokenize(text, **kwargs):
+        return backbone.tokenizer(text, **kwargs)
+
+    if "lasco_distill" in data_cfg:
+        dc = data_cfg["lasco_distill"]
+        dataset = build_lasco_distill_dataset(
+            subset_path=dc["subset_path"],
+            scores_path=dc["scores_path"],
+            images_dir=dc["images_dir"],
+            image_transform=image_transform,
+            caption_transform=tokenize,
+            max_length_tokenizer=77,
+        )
+        logger.info(f"LaSCo distill dataset loaded: {len(dataset):,} triplets")
+
+    elif "benchmark_distill" in data_cfg:
+        dc = data_cfg["benchmark_distill"]
+        dataset = build_benchmark_distill_dataset(
+            triplets_path=dc["triplets_path"],
+            scores_path=dc["scores_path"],
+            fashioniq_images_dir=dc["fashioniq_images_dir"],
+            cirr_images_dir=dc["cirr_images_dir"],
+            image_transform=image_transform,
+            caption_transform=tokenize,
+            max_length_tokenizer=77,
+        )
+        logger.info(f"Benchmark distill dataset loaded: {len(dataset):,} triplets (FashionIQ + CIRR)")
+
+    else:
+        raise ValueError(
+            "cfg['data'] must contain 'lasco_distill' or 'benchmark_distill' "
+            f"for distillation mode. Got keys: {list(data_cfg.keys())}"
+        )
+
+    return DataLoader(
+        dataset,
+        batch_size=tc["batch_size"],
+        shuffle=True,
+        num_workers=tc["num_workers"],
+        collate_fn=DistillCollator(),
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=tc["num_workers"] > 0,
     )
 
 
@@ -173,10 +229,10 @@ class Trainer:
         logger.info(f"Precision     : {self.precision}")
         logger.info(f"Output dir    : {self.output_dir}")
 
-        if self.training_mode == "distillation":
-            raise NotImplementedError(
-                "Distillation training (Setting 2) is not yet implemented. "
-                "Set training_mode: contrastive or implement _distillation_step()."
+        if self.training_mode not in ("contrastive", "distillation"):
+            raise ValueError(
+                f"Unknown training_mode: {self.training_mode!r}. "
+                "Use 'contrastive' or 'distillation'."
             )
 
         backbone = _build_backbone(self.cfg)
@@ -184,7 +240,11 @@ class Trainer:
         save_to_json(freeze_info, self.output_dir / "freeze_info.json")
         backbone.train()
 
-        loader = _build_dataloader(backbone, self.cfg)
+        if self.training_mode == "distillation":
+            loader = _build_distill_dataloader(backbone, self.cfg)
+        else:
+            loader = _build_dataloader(backbone, self.cfg)
+
         steps_per_epoch = len(loader)
         total_steps = steps_per_epoch * self.cfg["training"]["epochs"] // self.grad_accum
 
@@ -202,9 +262,14 @@ class Trainer:
 
         for epoch in range(1, self.cfg["training"]["epochs"] + 1):
             t0 = time.time()
-            train_metrics = self._train_epoch(
-                backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
-            )
+            if self.training_mode == "distillation":
+                train_metrics = self._distillation_train_epoch(
+                    backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
+                )
+            else:
+                train_metrics = self._train_epoch(
+                    backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
+                )
             elapsed = time.time() - t0
 
             eval_metrics: dict[str, float] = {}
@@ -284,6 +349,135 @@ class Trainer:
         avg_loss = total_loss / steps_per_epoch
         logger.info(f"[Epoch {epoch:02d}] avg_loss={avg_loss:.4f}")
         return {"avg_loss": avg_loss}
+
+    def _distillation_train_epoch(
+        self,
+        backbone: Visualized_BGE,
+        loader: DataLoader,
+        optimizer: AdamW,
+        scheduler: Any,
+        epoch: int,
+        steps_per_epoch: int,
+    ) -> dict[str, float]:
+        """Distillation training step — dispatches on distillation.loss from config.
+
+        margin_mse : MSE on pairwise (pos_score − neg_score) margins.
+        kl_div     : KL divergence on softmax distribution over pos + K negs (listwise).
+        """
+        dist_cfg = self.cfg.get("distillation", {})
+        loss_type = dist_cfg.get("loss", "margin_mse")
+        kl_temp = float(dist_cfg.get("kl_temperature", 1.0))
+        lambda_distill = float(dist_cfg.get("lambda_distill", 0.5))
+        contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
+        distill_component = dist_cfg.get("distill_component", "margin_mse")
+
+        valid_losses = ("margin_mse", "kl_div", "combined")
+        if loss_type not in valid_losses:
+            raise ValueError(f"Unknown distillation loss: {loss_type!r}. Use one of {valid_losses}.")
+
+        device = backbone.device
+        total_loss = 0.0
+        total_contrastive_loss = 0.0
+        total_distill_loss = 0.0
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(loader, start=1):
+            ref_images = batch.ref_images.to(device, non_blocking=True)
+            pos_images = batch.pos_images.to(device, non_blocking=True)
+            neg_images = batch.neg_images.to(device, non_blocking=True)   # [B, K, C, H, W]
+            texts = {
+                "input_ids": batch.input_ids.to(device, non_blocking=True),
+                "attention_mask": batch.attention_mask.to(device, non_blocking=True),
+            }
+            teacher_pos = batch.teacher_pos_scores.to(device, non_blocking=True)  # [B]
+            teacher_neg = batch.teacher_neg_scores.to(device, non_blocking=True)  # [B, K]
+
+            B, K = teacher_neg.shape
+
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                q_emb = backbone.encode_mm(ref_images, texts)    # [B, dim]
+                pos_emb = backbone.encode_image(pos_images)       # [B, dim]
+
+                # Encode all K negatives in one batched forward pass
+                neg_flat = neg_images.view(B * K, *neg_images.shape[2:])  # [B*K, C, H, W]
+                neg_emb = backbone.encode_image(neg_flat).view(B, K, -1)  # [B, K, dim]
+
+                # Cosine similarity (embeddings are L2-normalised by backbone)
+                pos_scores = (q_emb * pos_emb).sum(-1)                    # [B]
+                neg_scores = (q_emb.unsqueeze(1) * neg_emb).sum(-1)       # [B, K]
+
+                if loss_type == "margin_mse":
+                    student_margin = pos_scores.unsqueeze(1) - neg_scores  # [B, K]
+                    teacher_margin = teacher_pos.unsqueeze(1) - teacher_neg
+                    loss = F.mse_loss(student_margin, teacher_margin) / self.grad_accum
+
+                elif loss_type == "kl_div":
+                    all_student = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)
+                    all_teacher = torch.cat([teacher_pos.unsqueeze(1), teacher_neg], dim=1)
+                    p_teacher = F.softmax(all_teacher / kl_temp, dim=-1)
+                    log_p_student = F.log_softmax(all_student / kl_temp, dim=-1)
+                    loss = F.kl_div(log_p_student, p_teacher, reduction="batchmean") / self.grad_accum
+
+                else:  # combined
+                    # Stack pos at index 0, then K negs → [B, K+1]
+                    all_student = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)
+
+                    # Contrastive: CrossEntropy over K+1 candidates, pos always at index 0
+                    labels = torch.zeros(B, dtype=torch.long, device=device)
+                    loss_contrastive = F.cross_entropy(all_student / contrastive_temp, labels)
+
+                    # Distillation component
+                    if distill_component == "margin_mse":
+                        student_margin = pos_scores.unsqueeze(1) - neg_scores
+                        teacher_margin = teacher_pos.unsqueeze(1) - teacher_neg
+                        loss_distill = F.mse_loss(student_margin, teacher_margin)
+                    else:  # kl_div
+                        all_teacher = torch.cat([teacher_pos.unsqueeze(1), teacher_neg], dim=1)
+                        p_teacher = F.softmax(all_teacher / kl_temp, dim=-1)
+                        log_p_student = F.log_softmax(all_student / kl_temp, dim=-1)
+                        loss_distill = F.kl_div(log_p_student, p_teacher, reduction="batchmean")
+
+                    loss = ((1 - lambda_distill) * loss_contrastive + lambda_distill * loss_distill) / self.grad_accum
+                    total_contrastive_loss += loss_contrastive.item()
+                    total_distill_loss += loss_distill.item()
+
+            loss.backward()
+            total_loss += loss.item() * self.grad_accum
+
+            if step % self.grad_accum == 0 or step == steps_per_epoch:
+                torch.nn.utils.clip_grad_norm_(
+                    backbone.parameters(), self.max_grad_norm
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            if step % self.log_every == 0:
+                lr = scheduler.get_last_lr()[0]
+                if loss_type == "combined":
+                    logger.info(
+                        f"[Epoch {epoch:02d} | Step {step:05d}/{steps_per_epoch}] "
+                        f"combined_loss={loss.item() * self.grad_accum:.4f}  "
+                        f"contrastive={loss_contrastive.item():.4f}  distill={loss_distill.item():.4f}  lr={lr:.2e}"
+                    )
+                else:
+                    logger.info(
+                        f"[Epoch {epoch:02d} | Step {step:05d}/{steps_per_epoch}] "
+                        f"distill_loss={loss.item() * self.grad_accum:.4f}  lr={lr:.2e}"
+                    )
+
+        avg_loss = total_loss / steps_per_epoch
+        result = {"avg_loss": avg_loss}
+        if loss_type == "combined":
+            result["avg_contrastive_loss"] = total_contrastive_loss / steps_per_epoch
+            result["avg_distill_loss"] = total_distill_loss / steps_per_epoch
+            logger.info(
+                f"[Epoch {epoch:02d}] combined_avg_loss={avg_loss:.4f}  "
+                f"contrastive={result['avg_contrastive_loss']:.4f}  distill={result['avg_distill_loss']:.4f}"
+            )
+        else:
+            logger.info(f"[Epoch {epoch:02d}] distill_avg_loss={avg_loss:.4f}")
+        return result
 
     def _freeze_layers(self, backbone: Visualized_BGE) -> dict:
         """

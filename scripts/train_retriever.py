@@ -67,6 +67,68 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _build_training_details(cfg: dict) -> dict:
+    mode = cfg["training_mode"]
+    base = {
+        "backbone": "VISTA — Visualized BGE-base-en-v1.5 + EVA02-CLIP-B-16",
+        "effective_batch_size": (
+            cfg["training"]["batch_size"]
+            * cfg["training"]["gradient_accumulation_steps"]
+        ),
+        "freeze_strategy": cfg.get("freeze", {}).get("strategy", "full"),
+        "note_freeze_details": "see freeze_info.json in run output dir for exact layer counts",
+    }
+    if mode == "distillation":
+        dist = cfg.get("distillation", {})
+        data_cfg = cfg.get("data", {})
+        loss_type = dist.get("loss", "margin_mse")
+        _loss_descriptions = {
+            "margin_mse": "MarginMSE — MSE on pairwise (pos_score − neg_score) margins",
+            "kl_div": "KL Divergence — listwise softmax distribution over pos + K negatives",
+            "combined": "Combined — (1-λ)*CrossEntropy(student, hard_negs) + λ*distill_component",
+        }
+        loss_entry = {
+            "loss_type": loss_type,
+            "loss_function": _loss_descriptions.get(loss_type, loss_type),
+            "loss_defined_in": "src/training/trainer.py :: _distillation_train_epoch()",
+        }
+        if loss_type == "kl_div":
+            loss_entry["kl_temperature"] = dist.get("kl_temperature", 1.0)
+        if loss_type == "combined":
+            loss_entry["lambda_distill"] = dist.get("lambda_distill", 0.5)
+            loss_entry["contrastive_temperature"] = dist.get("contrastive_temperature", 0.02)
+            loss_entry["distill_component"] = dist.get("distill_component", "margin_mse")
+        base.update({
+            **loss_entry,
+            "teacher": dist.get("teacher", "qwen3vl_2b"),
+            "teacher_scores": dist.get("soft_labels_path", ""),
+            "num_negatives_K": data_cfg.get("num_negatives", 15),
+        })
+        if "lasco_distill" in data_cfg:
+            dc = data_cfg["lasco_distill"]
+            base.update({
+                "distill_data_source": "lasco",
+                "subset_path": dc.get("subset_path", ""),
+                "scores_path": dc.get("scores_path", ""),
+            })
+        elif "benchmark_distill" in data_cfg:
+            dc = data_cfg["benchmark_distill"]
+            base.update({
+                "distill_data_source": "fashioniq+cirr (training splits)",
+                "triplets_path": dc.get("triplets_path", ""),
+                "scores_path": dc.get("scores_path", ""),
+                "fashioniq_caption_mode": dc.get("fashioniq_caption_mode", "concat"),
+                "fashioniq_caption_separator": dc.get("fashioniq_caption_separator", ", "),
+            })
+    else:
+        base.update({
+            "loss_function": "CrossEntropyLoss (InfoNCE with in-batch negatives)",
+            "loss_defined_in": "src/retrievers/backbones/vista/modeling.py :: compute_loss()",
+            "temperature": cfg["training"].get("temperature", 0.02),
+        })
+    return base
+
+
 def build_run_config(cfg: dict, args: argparse.Namespace) -> dict:
     cuda_available = torch.cuda.is_available()
     return {
@@ -90,18 +152,7 @@ def build_run_config(cfg: dict, args: argparse.Namespace) -> dict:
         "data": cfg["data"],
         "distillation": cfg.get("distillation", {}),
         "evaluation": cfg["evaluation"],
-        "model_training_details": {
-            "backbone": "VISTA — Visualized BGE-base-en-v1.5 + EVA02-CLIP-B-16",
-            "loss_function": "CrossEntropyLoss (InfoNCE with in-batch negatives)",
-            "loss_defined_in": "src/retrievers/backbones/vista/modeling.py :: compute_loss()",
-            "temperature": cfg["training"].get("temperature", 0.02),
-            "effective_batch_size": (
-                cfg["training"]["batch_size"]
-                * cfg["training"]["gradient_accumulation_steps"]
-            ),
-            "freeze_strategy": cfg.get("freeze", {}).get("strategy", "full"),
-            "note_freeze_details": "see freeze_info.json in run output dir for exact layer counts",
-        },
+        "model_training_details": _build_training_details(cfg),
     }
 
 
