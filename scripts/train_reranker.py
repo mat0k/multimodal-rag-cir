@@ -82,7 +82,7 @@ def load_model_and_processor(
     torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         checkpoint_path,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         low_cpu_mem_usage=True,
         local_files_only=True,
     )
@@ -100,17 +100,20 @@ def freeze_model(
     freeze_bottom_lm_layers: int = 20,
 ) -> None:
     """Freeze vision encoder and bottom N LM layers in place."""
+    # Qwen3-VL structure: model.model.visual (ViT) + model.model.language_model (LM)
+    lm = model.model.language_model
+
     if freeze_vision:
-        for p in model.visual.parameters():
+        for p in model.model.visual.parameters():
             p.requires_grad = False
 
-    for p in model.model.embed_tokens.parameters():
+    for p in lm.embed_tokens.parameters():
         p.requires_grad = False
 
-    total_layers = len(model.model.layers)
+    total_layers = len(lm.layers)
     n_freeze = min(freeze_bottom_lm_layers, total_layers)
     for i in range(n_freeze):
-        for p in model.model.layers[i].parameters():
+        for p in lm.layers[i].parameters():
             p.requires_grad = False
 
     total_params = sum(p.numel() for p in model.parameters())
