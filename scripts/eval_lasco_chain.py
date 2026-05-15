@@ -308,28 +308,56 @@ def main(args: argparse.Namespace) -> None:
     logger.info(f"Output dir       : {output_dir}")
     logger.info("=" * 60)
 
-    # Stage A
-    t0 = time.time()
-    backbone = _load_retriever(retriever_ckpt)
-    corpus_entries, target_ids, query_img_paths, query_texts, gallery_ids_np, gallery_paths, top_indices = \
-        _stage_a_retrieve(
-            backbone, images_dir, val_path, corpus_path,
-            top_m=args.top_m, batch_size=args.batch_size, num_workers=args.num_workers,
-        )
+    # Stage A — run or load from cache
+    cache_path = Path(args.stage_a_cache) if args.stage_a_cache else None
+
+    if cache_path is not None and cache_path.exists():
+        logger.info(f"Loading Stage A cache from {cache_path}")
+        t0 = time.time()
+        cache = np.load(str(cache_path), allow_pickle=True).item()
+        corpus_entries  = cache["corpus_entries"]
+        target_ids      = cache["target_ids"]
+        query_img_paths = cache["query_img_paths"]
+        query_texts     = cache["query_texts"]
+        gallery_ids_np  = cache["gallery_ids_np"]
+        gallery_paths   = cache["gallery_paths"]
+        top_indices     = cache["top_indices"]
+        elapsed_a = time.time() - t0
+        logger.info(f"Stage A cache loaded in {elapsed_a:.1f}s")
+    else:
+        t0 = time.time()
+        backbone = _load_retriever(retriever_ckpt)
+        corpus_entries, target_ids, query_img_paths, query_texts, gallery_ids_np, gallery_paths, top_indices = \
+            _stage_a_retrieve(
+                backbone, images_dir, val_path, corpus_path,
+                top_m=args.top_m, batch_size=args.batch_size, num_workers=args.num_workers,
+            )
+        elapsed_a = time.time() - t0
+        logger.info(f"Stage A (retrieval) done in {elapsed_a/60:.1f} min")
+        del backbone
+        torch.cuda.empty_cache()
+
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(str(cache_path), {
+                "corpus_entries": corpus_entries,
+                "target_ids": target_ids,
+                "query_img_paths": query_img_paths,
+                "query_texts": query_texts,
+                "gallery_ids_np": gallery_ids_np,
+                "gallery_paths": gallery_paths,
+                "top_indices": top_indices,
+            })
+            logger.info(f"Stage A cache saved → {cache_path}")
+
     if max_queries is not None:
-        target_ids = target_ids[:max_queries]
+        target_ids      = target_ids[:max_queries]
         query_img_paths = query_img_paths[:max_queries]
-        query_texts = query_texts[:max_queries]
-        top_indices = top_indices[:max_queries]
-    elapsed_a = time.time() - t0
-    logger.info(f"Stage A (retrieval) done in {elapsed_a/60:.1f} min")
+        query_texts     = query_texts[:max_queries]
+        top_indices     = top_indices[:max_queries]
 
     # Retriever recall (before re-ranking)
     retriever_metrics = _compute_retriever_recall(target_ids, gallery_ids_np, top_indices, k_values)
-
-    # Free retriever GPU memory before loading Qwen
-    del backbone
-    torch.cuda.empty_cache()
 
     # Stage B
     t1 = time.time()
@@ -419,4 +447,6 @@ if __name__ == "__main__":
                         help="Root output directory (run_name will be appended).")
     parser.add_argument("--max_queries", type=int, default=None,
                         help="Limit evaluation to first N queries (for fast subset eval).")
+    parser.add_argument("--stage_a_cache", type=str, default=None,
+                        help="Path to save/load Stage A results (.npy). If exists, Stage A is skipped.")
     main(parser.parse_args())

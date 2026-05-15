@@ -282,14 +282,26 @@ def main(cfg: dict) -> None:
     # --- Dataset ---
     train_cfg = cfg["training"]
     data_cfg = cfg["data"]
-    dataset = LaSCoReranker(
-        subset_path=str(PROJECT_ROOT / data_cfg["subset_path"]),
-        scores_path=str(PROJECT_ROOT / data_cfg["scores_path"]),
-        images_dir=str(PROJECT_ROOT / data_cfg["images_dir"]),
-        neg_per_query=train_cfg.get("neg_per_query", 1),
-        max_queries=train_cfg.get("max_queries", None),
-        seed=train_cfg.get("seed", 42),
-    )
+    if "hard_neg_path" in data_cfg:
+        from src.datasets.lasco_reranker_hard_neg import LaSCoRerankerHardNeg
+        dataset = LaSCoRerankerHardNeg(
+            subset_path=str(PROJECT_ROOT / data_cfg["subset_path"]),
+            hard_neg_path=str(PROJECT_ROOT / data_cfg["hard_neg_path"]),
+            images_dir=str(PROJECT_ROOT / data_cfg["images_dir"]),
+            neg_per_query=train_cfg.get("neg_per_query", 1),
+            max_queries=train_cfg.get("max_queries", None),
+            seed=train_cfg.get("seed", 42),
+        )
+        logger.info("Using retriever-mined hard negatives.")
+    else:
+        dataset = LaSCoReranker(
+            subset_path=str(PROJECT_ROOT / data_cfg["subset_path"]),
+            scores_path=str(PROJECT_ROOT / data_cfg["scores_path"]),
+            images_dir=str(PROJECT_ROOT / data_cfg["images_dir"]),
+            neg_per_query=train_cfg.get("neg_per_query", 1),
+            max_queries=train_cfg.get("max_queries", None),
+            seed=train_cfg.get("seed", 42),
+        )
     logger.info(f"Dataset: {len(dataset):,} pairs")
 
     dataloader = DataLoader(
