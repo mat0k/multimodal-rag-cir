@@ -345,6 +345,7 @@ def main() -> None:
 
 	parser.add_argument("--output_path", type=str, default="", help="Root output directory.")
 	parser.add_argument("--run_name", type=str, default="", help="Output run folder name.")
+	parser.add_argument("--cirr_annotations", type=str, default="", help="Path to CIRR annotation JSON (e.g. data/cirr/annotations/captions/cap.rc2.val.json) for subset recall and summary_average.")
 	args = parser.parse_args()
 
 	config = load_yaml_config(args.config)
@@ -388,10 +389,12 @@ def main() -> None:
 		)
 
 		if dataset == "cirr":
+			cirr_ann = args.cirr_annotations if args.cirr_annotations else None
 			raw_metrics = evaluate_cirr_chain_records(
 				reranked_records,
 				k_values=tuple(int(k) for k in args.k_values),
 				latency_stats=latency_stats,
+				cirr_annotations_path=cirr_ann,
 			)
 			record_split = reranked_records[0].query.split if reranked_records else "val"
 		elif dataset == "fashioniq":

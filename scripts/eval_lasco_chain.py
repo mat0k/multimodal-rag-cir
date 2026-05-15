@@ -218,6 +218,27 @@ def _stage_a_retrieve(
 
 
 # ---------------------------------------------------------------------------
+# Stage A recall (computed from top_indices before re-ranking)
+# ---------------------------------------------------------------------------
+
+def _compute_retriever_recall(
+    target_ids: list[int],
+    gallery_ids_np: np.ndarray,
+    top_indices: np.ndarray,
+    k_values: list[int],
+) -> dict[str, float]:
+    Q = len(target_ids)
+    hits = {k: 0 for k in k_values}
+    for qi in range(Q):
+        tgt = target_ids[qi]
+        ranked_ids = gallery_ids_np[top_indices[qi]]
+        for k in k_values:
+            if tgt in ranked_ids[:k]:
+                hits[k] += 1
+    return {f"recall_at{k}": round(100.0 * hits[k] / Q, 4) for k in k_values}
+
+
+# ---------------------------------------------------------------------------
 # Stage B — Qwen re-ranking
 # ---------------------------------------------------------------------------
 
@@ -267,7 +288,7 @@ def _stage_b_rerank(
 # ---------------------------------------------------------------------------
 
 def main(args: argparse.Namespace) -> None:
-    output_dir = PROJECT_ROOT / "results" / "lasco_chain" / args.run_name
+    output_dir = PROJECT_ROOT / args.output_root / args.run_name
     output_dir.mkdir(parents=True, exist_ok=True)
     _setup_logging(output_dir)
 
@@ -276,6 +297,7 @@ def main(args: argparse.Namespace) -> None:
     images_dir = PROJECT_ROOT / "data/lasco/images"
     val_path = str(PROJECT_ROOT / "data/lasco/lasco_val.json")
     corpus_path = str(PROJECT_ROOT / "data/lasco/lasco_val_corpus.json")
+    max_queries = args.max_queries
 
     logger.info("=" * 60)
     logger.info(f"Run name         : {args.run_name}")
@@ -294,8 +316,16 @@ def main(args: argparse.Namespace) -> None:
             backbone, images_dir, val_path, corpus_path,
             top_m=args.top_m, batch_size=args.batch_size, num_workers=args.num_workers,
         )
+    if max_queries is not None:
+        target_ids = target_ids[:max_queries]
+        query_img_paths = query_img_paths[:max_queries]
+        query_texts = query_texts[:max_queries]
+        top_indices = top_indices[:max_queries]
     elapsed_a = time.time() - t0
-    logger.info(f"Stage A done in {elapsed_a/60:.1f} min")
+    logger.info(f"Stage A (retrieval) done in {elapsed_a/60:.1f} min")
+
+    # Retriever recall (before re-ranking)
+    retriever_metrics = _compute_retriever_recall(target_ids, gallery_ids_np, top_indices, k_values)
 
     # Free retriever GPU memory before loading Qwen
     del backbone
@@ -304,7 +334,7 @@ def main(args: argparse.Namespace) -> None:
     # Stage B
     t1 = time.time()
     reranker = build_reranker_from_config(args.reranker_config)
-    reranked_metrics = _stage_b_rerank(
+    reranker_metrics = _stage_b_rerank(
         reranker=reranker,
         corpus_entries=corpus_entries,
         gallery_paths=gallery_paths,
@@ -317,15 +347,19 @@ def main(args: argparse.Namespace) -> None:
         k_values=k_values,
     )
     elapsed_b = time.time() - t1
-    logger.info(f"Stage B done in {elapsed_b/60:.1f} min")
+    logger.info(f"Stage B (reranking) done in {elapsed_b/60:.1f} min")
 
     # Log results
     logger.info("-" * 40)
     logger.info(f"LaSCo chain results — {args.run_name}")
+    logger.info("  [Retriever]")
     for k in k_values:
-        logger.info(f"  Recall@{k:<4d}: {reranked_metrics[f'recall_at{k}']:.2f}%")
-    logger.info(f"  Stage A elapsed : {elapsed_a/60:.1f} min")
-    logger.info(f"  Stage B elapsed : {elapsed_b/60:.1f} min")
+        logger.info(f"    Recall@{k:<4d}: {retriever_metrics[f'recall_at{k}']:.2f}%")
+    logger.info("  [Reranker]")
+    for k in k_values:
+        logger.info(f"    Recall@{k:<4d}: {reranker_metrics[f'recall_at{k}']:.2f}%")
+    logger.info(f"  Retrieval elapsed : {elapsed_a/60:.1f} min")
+    logger.info(f"  Reranking elapsed : {elapsed_b/60:.1f} min")
     logger.info("-" * 40)
 
     # Save
@@ -335,13 +369,11 @@ def main(args: argparse.Namespace) -> None:
         "run_name": args.run_name,
         "dataset": "lasco_val",
         "pipeline": {
-            "stage_a_retriever": retriever_ckpt or "zero_shot (base VISTA weights)",
-            "stage_b_reranker": args.reranker_config,
-            "top_m": args.top_m,
+            "retriever": retriever_ckpt or "zero_shot (base VISTA weights)",
+            "reranker": args.reranker_config,
+            "pool_size": args.top_m,
             "rerank_top_n": args.rerank_top_n,
             "k_values": k_values,
-            "batch_size_retriever": args.batch_size,
-            "num_workers": args.num_workers,
         },
         "runtime": {
             "python_version": sys.version.split()[0],
@@ -349,11 +381,12 @@ def main(args: argparse.Namespace) -> None:
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda,
             "gpu_name": torch.cuda.get_device_name(0) if cuda_available else None,
-            "stage_a_elapsed_seconds": round(elapsed_a, 1),
-            "stage_b_elapsed_seconds": round(elapsed_b, 1),
+            "retrieval_elapsed_seconds": round(elapsed_a, 1),
+            "reranking_elapsed_seconds": round(elapsed_b, 1),
             "total_elapsed_seconds": round(elapsed_a + elapsed_b, 1),
         },
-        "metrics": reranked_metrics,
+        "retriever": retriever_metrics,
+        "reranker": reranker_metrics,
     }
 
     with open(output_dir / "metrics.json", "w") as f:
@@ -382,4 +415,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--k", type=int, nargs="+", default=[1, 5, 10, 50, 100],
                         help="K values for Recall@K.")
+    parser.add_argument("--output_root", type=str, default="results/lasco_chain",
+                        help="Root output directory (run_name will be appended).")
+    parser.add_argument("--max_queries", type=int, default=None,
+                        help="Limit evaluation to first N queries (for fast subset eval).")
     main(parser.parse_args())
