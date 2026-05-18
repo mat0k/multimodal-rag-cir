@@ -217,20 +217,68 @@ def train_epoch(
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint saving — merge LoRA into base weights for inference compatibility
+# Checkpoint saving
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, processor: Qwen3VLProcessor, output_dir: Path, epoch: int) -> Path:
-    """Merge LoRA adapters into base weights and save a full HF checkpoint."""
-    ckpt_dir = output_dir / "checkpoints" / f"epoch_{epoch:02d}"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+def save_adapter_checkpoint(model, processor: Qwen3VLProcessor, output_dir: Path, epoch: int) -> Path:
+    """Save only the LoRA adapter weights — does NOT modify the training model.
 
-    logger.info(f"Merging LoRA weights for epoch {epoch} …")
-    merged = model.merge_and_unload()   # returns a plain Qwen3VLForConditionalGeneration
-    merged.save_pretrained(str(ckpt_dir))
-    processor.save_pretrained(str(ckpt_dir))
-    logger.info(f"Checkpoint saved → {ckpt_dir}")
-    return ckpt_dir
+    Calling merge_and_unload() mid-training destroys the PEFT model in-place,
+    stripping LoRA adapters so subsequent epochs train nothing. Saving adapters
+    only avoids this and is also much cheaper (a few MB vs several GB).
+
+    Full merged HF checkpoints are produced by _merge_all_adapters() after
+    the training loop finishes.
+    """
+    adapter_dir = output_dir / "adapters" / f"epoch_{epoch:02d}"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(adapter_dir))   # saves adapter_model.safetensors + adapter_config.json
+    processor.save_pretrained(str(adapter_dir))
+    logger.info(f"Adapter checkpoint saved → {adapter_dir}")
+    return adapter_dir
+
+
+def _merge_all_adapters(
+    base_ckpt: str,
+    dtype: str,
+    output_dir: Path,
+    epochs: int,
+    lora_cfg: dict,
+) -> None:
+    """Load base model + each epoch's adapter and save merged HF checkpoints.
+
+    Called once after the training loop — at this point the GPU is free so
+    we can load the base model fresh and merge without touching the training model.
+    """
+    from peft import PeftModel
+
+    torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
+
+    for epoch in range(1, epochs + 1):
+        adapter_dir = output_dir / "adapters" / f"epoch_{epoch:02d}"
+        ckpt_dir = output_dir / "checkpoints" / f"epoch_{epoch:02d}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        if not adapter_dir.exists():
+            logger.warning(f"Adapter dir missing, skipping epoch {epoch}: {adapter_dir}")
+            continue
+
+        logger.info(f"Merging epoch {epoch} adapters into full HF checkpoint …")
+        base_model = Qwen3VLForConditionalGeneration.from_pretrained(
+            base_ckpt, dtype=torch_dtype, low_cpu_mem_usage=True, local_files_only=True,
+        )
+        peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
+        merged = peft_model.merge_and_unload()
+        merged.save_pretrained(str(ckpt_dir))
+
+        processor = Qwen3VLProcessor.from_pretrained(
+            str(adapter_dir), use_fast=False, local_files_only=True,
+        )
+        processor.save_pretrained(str(ckpt_dir))
+
+        del base_model, peft_model, merged
+        torch.cuda.empty_cache()
+        logger.info(f"Checkpoint saved → {ckpt_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +410,20 @@ def main(cfg: dict) -> None:
             json.dump(train_log, f, indent=2)
 
         if train_cfg.get("save_every_epoch", True):
-            save_checkpoint(model, processor, output_dir, epoch)
+            save_adapter_checkpoint(model, processor, output_dir, epoch)
 
     total_elapsed = time.time() - t_start
     logger.info(f"Training done in {total_elapsed/3600:.2f}h  ({total_elapsed:.0f}s)")
+
+    # Merge adapters into full HF checkpoints (after training loop — GPU is free)
+    logger.info("Merging LoRA adapters into full HF checkpoints …")
+    _merge_all_adapters(
+        base_ckpt=ckpt_path,
+        dtype=cfg["model"].get("dtype", "bfloat16"),
+        output_dir=output_dir,
+        epochs=epochs,
+        lora_cfg=lora_cfg,
+    )
 
     info = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
