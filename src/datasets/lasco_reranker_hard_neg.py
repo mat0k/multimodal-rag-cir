@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 class LaSCoRerankerHardNeg(Dataset):
-    """Flat (ref, text, candidate, label) pairs using retriever hard negatives."""
+    """Flat (ref, text, candidate, label) pairs using retriever hard negatives.
+
+    Uses two independent RNGs so the query subset stays stable across epochs
+    while negatives can be rotated by passing a different neg_seed each epoch.
+    """
 
     def __init__(
         self,
@@ -31,6 +35,7 @@ class LaSCoRerankerHardNeg(Dataset):
         neg_per_query: int = 1,
         max_queries: Optional[int] = None,
         seed: int = 42,
+        neg_seed: Optional[int] = None,
     ):
         super().__init__()
         self.images_dir = Path(images_dir)
@@ -42,9 +47,13 @@ class LaSCoRerankerHardNeg(Dataset):
 
         triplets = [t for t in all_triplets if str(t["qid"]) in hard_neg_map]
 
-        rng = random.Random(seed)
+        # Fixed RNG for query subsetting — same 5K queries every epoch regardless of neg_seed
+        query_rng = random.Random(seed)
         if max_queries is not None and max_queries < len(triplets):
-            triplets = rng.sample(triplets, max_queries)
+            triplets = query_rng.sample(triplets, max_queries)
+
+        # Separate RNG for negative sampling — pass neg_seed=epoch to rotate negatives
+        neg_rng = random.Random(neg_seed if neg_seed is not None else seed)
 
         self._pairs: list[tuple[str, str, str, int]] = []
         missing = 0
@@ -60,7 +69,7 @@ class LaSCoRerankerHardNeg(Dataset):
             if not negs:
                 missing += 1
                 continue
-            chosen = rng.sample(negs, min(neg_per_query, len(negs)))
+            chosen = neg_rng.sample(negs, min(neg_per_query, len(negs)))
             for neg_rel in chosen:
                 self._pairs.append((ref_path, text, str(self.images_dir / neg_rel), 0))
 

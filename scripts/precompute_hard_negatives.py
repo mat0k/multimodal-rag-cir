@@ -256,8 +256,8 @@ if __name__ == "__main__":
         "--retriever_checkpoint", type=str, default=None,
         help="Path to fine-tuned VISTA .pth checkpoint. Omit for zero-shot.",
     )
-    parser.add_argument("--top_k", type=int, default=15,
-                        help="Number of hard negatives to save per query.")
+    parser.add_argument("--top_k", type=int, default=3,
+                        help="Number of hard negatives to save per query (one per planned epoch).")
     parser.add_argument("--output", type=str, required=True,
                         help="Output JSON path (relative to project root or absolute).")
     parser.add_argument("--batch_size", type=int, default=256)

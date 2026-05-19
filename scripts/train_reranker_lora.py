@@ -327,35 +327,39 @@ def main(cfg: dict) -> None:
     no_id = _get_token_id(processor, " no")
     logger.info(f"yes_id={yes_id}, no_id={no_id}")
 
-    # --- Dataset ---
+    # --- Dataset helpers ---
     train_cfg = cfg["training"]
     data_cfg = cfg["data"]
-    if "hard_neg_path" in data_cfg:
-        from src.datasets.lasco_reranker_hard_neg import LaSCoRerankerHardNeg
-        dataset = LaSCoRerankerHardNeg(
-            subset_path=str(PROJECT_ROOT / data_cfg["subset_path"]),
-            hard_neg_path=str(PROJECT_ROOT / data_cfg["hard_neg_path"]),
-            images_dir=str(PROJECT_ROOT / data_cfg["images_dir"]),
-            neg_per_query=train_cfg.get("neg_per_query", 1),
-            max_queries=train_cfg.get("max_queries", None),
-            seed=train_cfg.get("seed", 42),
-        )
-        logger.info("Using retriever-mined hard negatives.")
-    else:
-        dataset = LaSCoReranker(
+    use_hard_neg = "hard_neg_path" in data_cfg
+    base_seed = train_cfg.get("seed", 42)
+    num_workers = train_cfg.get("num_workers", 2)
+
+    def _build_dataset(neg_seed: int):
+        if use_hard_neg:
+            from src.datasets.lasco_reranker_hard_neg import LaSCoRerankerHardNeg
+            return LaSCoRerankerHardNeg(
+                subset_path=str(PROJECT_ROOT / data_cfg["subset_path"]),
+                hard_neg_path=str(PROJECT_ROOT / data_cfg["hard_neg_path"]),
+                images_dir=str(PROJECT_ROOT / data_cfg["images_dir"]),
+                neg_per_query=train_cfg.get("neg_per_query", 1),
+                max_queries=train_cfg.get("max_queries", None),
+                seed=base_seed,
+                neg_seed=neg_seed,
+            )
+        return LaSCoReranker(
             subset_path=str(PROJECT_ROOT / data_cfg["subset_path"]),
             scores_path=str(PROJECT_ROOT / data_cfg["scores_path"]),
             images_dir=str(PROJECT_ROOT / data_cfg["images_dir"]),
             neg_per_query=train_cfg.get("neg_per_query", 1),
             max_queries=train_cfg.get("max_queries", None),
-            seed=train_cfg.get("seed", 42),
+            seed=neg_seed,
         )
-    logger.info(f"Dataset: {len(dataset):,} pairs")
 
-    dataloader = DataLoader(
-        dataset, batch_size=1, shuffle=True,
-        num_workers=train_cfg.get("num_workers", 2), pin_memory=False,
-    )
+    if use_hard_neg:
+        logger.info("Using retriever-mined hard negatives — negatives rotated each epoch.")
+    # Build once to get pair count for optimizer/scheduler setup
+    n_pairs = len(_build_dataset(neg_seed=base_seed))
+    logger.info(f"Pairs/epoch: {n_pairs:,}")
 
     # --- Optimizer / scheduler ---
     lr = float(train_cfg.get("learning_rate", 2e-4))
@@ -368,10 +372,11 @@ def main(cfg: dict) -> None:
         lr=lr,
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
     )
-    total_steps = math.ceil(len(dataloader) / grad_accum) * epochs
+    steps_per_epoch = math.ceil(n_pairs / grad_accum)
+    total_steps = steps_per_epoch * epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=lr * 0.1)
 
-    logger.info(f"Epochs: {epochs}  |  Steps/epoch: {math.ceil(len(dataloader)/grad_accum)}  "
+    logger.info(f"Epochs: {epochs}  |  Steps/epoch: {steps_per_epoch}  "
                 f"|  LR: {lr}  |  grad_accum: {grad_accum}  |  warmup: {warmup_steps}")
 
     # --- Training loop ---
@@ -380,6 +385,13 @@ def main(cfg: dict) -> None:
     t_start = time.time()
 
     for epoch in range(1, epochs + 1):
+        # Rebuild dataset each epoch: same query subset (base_seed), different neg (neg_seed=epoch)
+        dataset = _build_dataset(neg_seed=epoch)
+        dataloader = DataLoader(
+            dataset, batch_size=1, shuffle=True,
+            num_workers=num_workers, pin_memory=False,
+        )
+
         t_epoch = time.time()
         results = train_epoch(
             model, processor, dataloader, optimizer, device,
@@ -387,7 +399,7 @@ def main(cfg: dict) -> None:
         )
         elapsed = time.time() - t_epoch
 
-        for _ in range(math.ceil(len(dataloader) / grad_accum)):
+        for _ in range(steps_per_epoch):
             global_step += 1
             if global_step > warmup_steps:
                 scheduler.step()
