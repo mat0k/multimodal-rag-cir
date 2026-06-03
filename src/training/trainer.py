@@ -363,6 +363,7 @@ class Trainer:
 
         margin_mse : MSE on pairwise (pos_score − neg_score) margins.
         kl_div     : KL divergence on softmax distribution over pos + K negs (listwise).
+        list_mle   : Plackett-Luce log-likelihood of teacher ranking permutation (listwise).
         """
         dist_cfg = self.cfg.get("distillation", {})
         loss_type = dist_cfg.get("loss", "margin_mse")
@@ -371,7 +372,7 @@ class Trainer:
         contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
         distill_component = dist_cfg.get("distill_component", "margin_mse")
 
-        valid_losses = ("margin_mse", "kl_div", "combined")
+        valid_losses = ("margin_mse", "kl_div", "list_mle", "combined")
         if loss_type not in valid_losses:
             raise ValueError(f"Unknown distillation loss: {loss_type!r}. Use one of {valid_losses}.")
 
@@ -417,6 +418,17 @@ class Trainer:
                     p_teacher = F.softmax(all_teacher / kl_temp, dim=-1)
                     log_p_student = F.log_softmax(all_student / kl_temp, dim=-1)
                     loss = F.kl_div(log_p_student, p_teacher, reduction="batchmean") / self.grad_accum
+
+                elif loss_type == "list_mle":
+                    all_student = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)  # [B, K+1]
+                    all_teacher = torch.cat([teacher_pos.unsqueeze(1), teacher_neg], dim=1)  # [B, K+1]
+                    # Sort items by teacher score descending to define target permutation
+                    perm = torch.argsort(all_teacher, dim=-1, descending=True)
+                    sorted_student = all_student.gather(dim=-1, index=perm)  # [B, K+1]
+                    # Suffix log-sum-exp: logsumexp(sorted_student[i:]) for each position i
+                    suffix_lse = torch.logcumsumexp(sorted_student.flip(dims=[-1]), dim=-1).flip(dims=[-1])
+                    # Plackett-Luce NLL: sum_i (suffix_lse_i - sorted_student_i), averaged over batch
+                    loss = (suffix_lse - sorted_student).sum(dim=-1).mean() / self.grad_accum
 
                 else:  # combined
                     # Stack pos at index 0, then K negs → [B, K+1]

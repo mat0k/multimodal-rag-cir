@@ -85,6 +85,7 @@ def _build_training_details(cfg: dict) -> dict:
         _loss_descriptions = {
             "margin_mse": "MarginMSE — MSE on pairwise (pos_score − neg_score) margins",
             "kl_div": "KL Divergence — listwise softmax distribution over pos + K negatives",
+            "list_mle": "ListMLE — Plackett-Luce NLL of teacher ranking permutation (listwise)",
             "combined": "Combined — (1-λ)*CrossEntropy(student, hard_negs) + λ*distill_component",
         }
         loss_entry = {
