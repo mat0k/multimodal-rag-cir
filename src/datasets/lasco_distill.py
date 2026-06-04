@@ -83,10 +83,17 @@ class LaSCoDistill(Dataset):
         ref_image = self._load_image(triplet["query-image"][1])
         pos_image = self._load_image(triplet["target-image"][1])
 
-        neg_images = torch.stack([
-            self._load_image(self.by_qid[neg_qid]["target-image"][1])
-            for neg_qid in scores["neg_qids"]
-        ])  # [K, C, H, W]
+        if "neg_img_paths" in scores:
+            # Hard-negative format: paths stored directly (retriever-mined)
+            neg_images = torch.stack([
+                self._load_image(path) for path in scores["neg_img_paths"]
+            ])
+        else:
+            # Random-negative format: look up target image of another triplet by qid
+            neg_images = torch.stack([
+                self._load_image(self.by_qid[neg_qid]["target-image"][1])
+                for neg_qid in scores["neg_qids"]
+            ])  # [K, C, H, W]
 
         text = triplet["query-text"]
         if self.caption_transform is not None:

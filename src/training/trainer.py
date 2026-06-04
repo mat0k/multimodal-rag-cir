@@ -427,8 +427,9 @@ class Trainer:
                     sorted_student = all_student.gather(dim=-1, index=perm)  # [B, K+1]
                     # Suffix log-sum-exp: logsumexp(sorted_student[i:]) for each position i
                     suffix_lse = torch.logcumsumexp(sorted_student.flip(dims=[-1]), dim=-1).flip(dims=[-1])
-                    # Plackett-Luce NLL: sum_i (suffix_lse_i - sorted_student_i), averaged over batch
-                    loss = (suffix_lse - sorted_student).sum(dim=-1).mean() / self.grad_accum
+                    # Plackett-Luce NLL normalised by list length so scale is independent of K
+                    K_plus_1 = sorted_student.shape[-1]
+                    loss = (suffix_lse - sorted_student).sum(dim=-1).mean() / K_plus_1 / self.grad_accum
 
                 else:  # combined
                     # Stack pos at index 0, then K negs → [B, K+1]
