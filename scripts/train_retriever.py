@@ -87,6 +87,7 @@ def _build_training_details(cfg: dict) -> dict:
             "kl_div": "KL Divergence — listwise softmax distribution over pos + K negatives",
             "list_mle": "ListMLE — Plackett-Luce NLL of teacher ranking permutation (listwise)",
             "combined": "Combined — (1-λ)*CrossEntropy(student, hard_negs) + λ*distill_component",
+            "relation": "Relation — row-wise KL + col-wise KL + contrastive CE over the G×G teacher matrix (group-matrix structural KD)",
         }
         loss_entry = {
             "loss_type": loss_type,
@@ -99,13 +100,27 @@ def _build_training_details(cfg: dict) -> dict:
             loss_entry["lambda_distill"] = dist.get("lambda_distill", 0.5)
             loss_entry["contrastive_temperature"] = dist.get("contrastive_temperature", 0.02)
             loss_entry["distill_component"] = dist.get("distill_component", "margin_mse")
+        if loss_type == "relation":
+            loss_entry["kl_temperature"] = dist.get("kl_temperature", 1.0)
+            loss_entry["row_weight"] = dist.get("row_weight", 1.0)
+            loss_entry["col_weight"] = dist.get("col_weight", 1.0)
+            loss_entry["lambda_contrastive"] = dist.get("lambda_contrastive", 0.2)
+            loss_entry["contrastive_temperature"] = dist.get("contrastive_temperature", 0.02)
         base.update({
             **loss_entry,
             "teacher": dist.get("teacher", "qwen3vl_2b"),
             "teacher_scores": dist.get("soft_labels_path", ""),
-            "num_negatives_K": data_cfg.get("num_negatives", 15),
         })
-        if "lasco_distill" in data_cfg:
+        if loss_type != "relation":
+            base["num_negatives_K"] = data_cfg.get("num_negatives", 15)
+        if "lasco_relation_distill" in data_cfg:
+            dc = data_cfg["lasco_relation_distill"]
+            base.update({
+                "distill_data_source": "lasco (group-matrix)",
+                "subset_path": dc.get("subset_path", ""),
+                "matrix_path": dc.get("matrix_path", ""),
+            })
+        elif "lasco_distill" in data_cfg:
             dc = data_cfg["lasco_distill"]
             base.update({
                 "distill_data_source": "lasco",

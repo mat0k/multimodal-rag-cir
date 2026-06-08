@@ -19,11 +19,13 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.lasco import build_lasco_dataset
 from src.datasets.lasco_distill import build_lasco_distill_dataset
+from src.datasets.lasco_relation_distill import build_lasco_relation_distill_dataset
 from src.datasets.benchmark_distill import build_benchmark_distill_dataset
 from src.retrievers.backbones.vista.modeling import Visualized_BGE
 from src.retrievers.vista_retriever import VistaImageProcessor
 from src.training.collator import LaSCoCollator
 from src.training.distill_collator import DistillCollator
+from src.training.relation_collator import RelationCollator
 from src.utils.io import save_to_json
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,31 @@ def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader
 
     def tokenize(text, **kwargs):
         return backbone.tokenizer(text, **kwargs)
+
+    if "lasco_relation_distill" in data_cfg:
+        dc = data_cfg["lasco_relation_distill"]
+        dataset = build_lasco_relation_distill_dataset(
+            subset_path=dc["subset_path"],
+            matrix_path=dc["matrix_path"],
+            images_dir=dc["images_dir"],
+            image_transform=image_transform,
+            caption_transform=tokenize,
+            max_length_tokenizer=77,
+        )
+        logger.info(
+            f"LaSCo relation distill dataset loaded: {len(dataset):,} groups "
+            f"of size {dataset.group_size}"
+        )
+        return DataLoader(
+            dataset,
+            batch_size=tc["batch_size"],          # = groups per step
+            shuffle=True,
+            num_workers=tc["num_workers"],
+            collate_fn=RelationCollator(),
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=tc["num_workers"] > 0,
+        )
 
     if "lasco_distill" in data_cfg:
         dc = data_cfg["lasco_distill"]
@@ -367,6 +394,12 @@ class Trainer:
         """
         dist_cfg = self.cfg.get("distillation", {})
         loss_type = dist_cfg.get("loss", "margin_mse")
+
+        if loss_type == "relation":
+            return self._relation_train_epoch(
+                backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
+            )
+
         kl_temp = float(dist_cfg.get("kl_temperature", 1.0))
         lambda_distill = float(dist_cfg.get("lambda_distill", 0.5))
         contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
@@ -432,7 +465,8 @@ class Trainer:
                     loss = (suffix_lse - sorted_student).sum(dim=-1).mean() / K_plus_1 / self.grad_accum
 
                 else:  # combined
-                    # Stack pos at index 0, then K negs → [B, K+1]
+                    #
+                    #  Stack pos at index 0, then K negs → [B, K+1]
                     all_student = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)
 
                     # Contrastive: CrossEntropy over K+1 candidates, pos always at index 0
@@ -490,6 +524,127 @@ class Trainer:
             )
         else:
             logger.info(f"[Epoch {epoch:02d}] distill_avg_loss={avg_loss:.4f}")
+        return result
+
+    def _relation_train_epoch(
+        self,
+        backbone: Visualized_BGE,
+        loader: DataLoader,
+        optimizer: AdamW,
+        scheduler: Any,
+        epoch: int,
+        steps_per_epoch: int,
+    ) -> dict[str, float]:
+        """Relation-based (group-matrix) distillation.
+
+        For each group of G queries sharing a pool of G candidates, the student
+        builds a G x G cosine-similarity matrix and is trained to reproduce the
+        STRUCTURE of the teacher's G x G relevance matrix via:
+          - row-wise KL  : per query,     distribution over candidates  (q -> c)
+          - col-wise KL  : per candidate, distribution over queries      (c -> q)
+          - contrastive  : cross-entropy with diagonal labels (in-group negatives)
+
+        total = lambda_contrastive * CE + row_weight * KL_row + col_weight * KL_col
+
+        Set col_weight=0 to recover a pure row-wise (response-style) listwise
+        objective — the ablation that isolates the relational (column) signal.
+        """
+        dist_cfg = self.cfg.get("distillation", {})
+        kl_temp = float(dist_cfg.get("kl_temperature", 1.0))
+        row_weight = float(dist_cfg.get("row_weight", 1.0))
+        col_weight = float(dist_cfg.get("col_weight", 1.0))
+        lambda_contrastive = float(dist_cfg.get("lambda_contrastive", 0.2))
+        contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
+
+        device = backbone.device
+        total_loss = total_row = total_col = total_ce = 0.0
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(loader, start=1):
+            B, G = batch.teacher_matrix.shape[:2]
+            ref = batch.ref_images.to(device, non_blocking=True)       # [B, G, C, H, W]
+            cand = batch.cand_images.to(device, non_blocking=True)     # [B, G, C, H, W]
+            input_ids = batch.input_ids.to(device, non_blocking=True)  # [B, G, T]
+            attention_mask = batch.attention_mask.to(device, non_blocking=True)
+            teacher = batch.teacher_matrix.to(device, non_blocking=True)  # [B, G, G]
+
+            C, H, W = ref.shape[2:]
+            T = input_ids.shape[-1]
+            ref_flat = ref.view(B * G, C, H, W)
+            cand_flat = cand.view(B * G, C, H, W)
+            texts = {
+                "input_ids": input_ids.view(B * G, T),
+                "attention_mask": attention_mask.view(B * G, T),
+            }
+
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                q_emb = backbone.encode_mm(ref_flat, texts).view(B, G, -1)  # [B, G, d]
+                c_emb = backbone.encode_image(cand_flat).view(B, G, -1)     # [B, G, d]
+
+                # Student G x G cosine-similarity matrix per group
+                student = torch.bmm(q_emb, c_emb.transpose(1, 2))          # [B, G, G]
+
+                # row-wise KL: per query over candidates
+                s_rows = student.reshape(B * G, G)
+                t_rows = teacher.reshape(B * G, G)
+                kl_row = F.kl_div(
+                    F.log_softmax(s_rows / kl_temp, dim=-1),
+                    F.softmax(t_rows / kl_temp, dim=-1),
+                    reduction="batchmean",
+                )
+
+                # col-wise KL: per candidate over queries (transpose first)
+                s_cols = student.transpose(1, 2).reshape(B * G, G)
+                t_cols = teacher.transpose(1, 2).reshape(B * G, G)
+                kl_col = F.kl_div(
+                    F.log_softmax(s_cols / kl_temp, dim=-1),
+                    F.softmax(t_cols / kl_temp, dim=-1),
+                    reduction="batchmean",
+                )
+
+                # contrastive CE: diagonal is the positive within each group
+                labels = torch.arange(G, device=device).repeat(B)         # [B*G]
+                ce = F.cross_entropy(s_rows / contrastive_temp, labels)
+
+                loss = (
+                    lambda_contrastive * ce
+                    + row_weight * kl_row
+                    + col_weight * kl_col
+                ) / self.grad_accum
+
+            loss.backward()
+            total_loss += loss.item() * self.grad_accum
+            total_row += kl_row.item()
+            total_col += kl_col.item()
+            total_ce += ce.item()
+
+            if step % self.grad_accum == 0 or step == steps_per_epoch:
+                torch.nn.utils.clip_grad_norm_(backbone.parameters(), self.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            if step % self.log_every == 0:
+                lr = scheduler.get_last_lr()[0]
+                logger.info(
+                    f"[Epoch {epoch:02d} | Step {step:05d}/{steps_per_epoch}] "
+                    f"relation_loss={loss.item() * self.grad_accum:.4f}  "
+                    f"row_kl={kl_row.item():.4f}  col_kl={kl_col.item():.4f}  "
+                    f"ce={ce.item():.4f}  lr={lr:.2e}"
+                )
+
+        avg_loss = total_loss / steps_per_epoch
+        result = {
+            "avg_loss": avg_loss,
+            "avg_row_kl": total_row / steps_per_epoch,
+            "avg_col_kl": total_col / steps_per_epoch,
+            "avg_contrastive_loss": total_ce / steps_per_epoch,
+        }
+        logger.info(
+            f"[Epoch {epoch:02d}] relation_avg_loss={avg_loss:.4f}  "
+            f"row_kl={result['avg_row_kl']:.4f}  col_kl={result['avg_col_kl']:.4f}  "
+            f"ce={result['avg_contrastive_loss']:.4f}"
+        )
         return result
 
     def _freeze_layers(self, backbone: Visualized_BGE) -> dict:
