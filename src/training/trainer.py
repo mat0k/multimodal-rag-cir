@@ -31,6 +31,20 @@ from src.utils.io import save_to_json
 logger = logging.getLogger(__name__)
 
 
+def _zscore(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """Per-row (per-query) standardisation: zero mean, unit std along `dim`.
+
+    Used to put teacher and student scores on a common scale before the
+    distillation loss.  Teacher reranker scores live on a tiny, teacher-specific
+    range (e.g. Qwen ~0.01-0.12) that is incomparable to the student's cosine
+    similarities; standardising each query's K+1 scores keeps only the *ranking
+    structure*, which is what we actually want to distil.
+    """
+    mean = x.mean(dim=dim, keepdim=True)
+    std = x.std(dim=dim, keepdim=True)
+    return (x - mean) / (std + eps)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -404,6 +418,10 @@ class Trainer:
         lambda_distill = float(dist_cfg.get("lambda_distill", 0.5))
         contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
         distill_component = dist_cfg.get("distill_component", "margin_mse")
+        # Per-query standardisation of teacher+student scores before the distill
+        # loss. Off by default to keep older runs reproducible; the contrastive
+        # CE term always uses raw cosine sims regardless of this flag.
+        normalize_distill = bool(dist_cfg.get("normalize_scores", False))
 
         valid_losses = ("margin_mse", "kl_div", "list_mle", "combined")
         if loss_type not in valid_losses:
@@ -441,13 +459,21 @@ class Trainer:
                 neg_scores = (q_emb.unsqueeze(1) * neg_emb).sum(-1)       # [B, K]
 
                 if loss_type == "margin_mse":
-                    student_margin = pos_scores.unsqueeze(1) - neg_scores  # [B, K]
-                    teacher_margin = teacher_pos.unsqueeze(1) - teacher_neg
+                    all_student = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)  # [B, K+1]
+                    all_teacher = torch.cat([teacher_pos.unsqueeze(1), teacher_neg], dim=1)
+                    if normalize_distill:
+                        all_student = _zscore(all_student)
+                        all_teacher = _zscore(all_teacher)
+                    student_margin = all_student[:, :1] - all_student[:, 1:]  # [B, K]
+                    teacher_margin = all_teacher[:, :1] - all_teacher[:, 1:]
                     loss = F.mse_loss(student_margin, teacher_margin) / self.grad_accum
 
                 elif loss_type == "kl_div":
                     all_student = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)
                     all_teacher = torch.cat([teacher_pos.unsqueeze(1), teacher_neg], dim=1)
+                    if normalize_distill:
+                        all_student = _zscore(all_student)
+                        all_teacher = _zscore(all_teacher)
                     p_teacher = F.softmax(all_teacher / kl_temp, dim=-1)
                     log_p_student = F.log_softmax(all_student / kl_temp, dim=-1)
                     loss = F.kl_div(log_p_student, p_teacher, reduction="batchmean") / self.grad_accum
@@ -468,20 +494,25 @@ class Trainer:
                     #
                     #  Stack pos at index 0, then K negs → [B, K+1]
                     all_student = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)
+                    all_teacher = torch.cat([teacher_pos.unsqueeze(1), teacher_neg], dim=1)
 
-                    # Contrastive: CrossEntropy over K+1 candidates, pos always at index 0
+                    # Contrastive: CrossEntropy over K+1 candidates, pos always at
+                    # index 0. ALWAYS uses raw cosine sims — normalisation must not
+                    # touch the retrieval objective.
                     labels = torch.zeros(B, dtype=torch.long, device=device)
                     loss_contrastive = F.cross_entropy(all_student / contrastive_temp, labels)
 
-                    # Distillation component
+                    # Distillation component operates on (optionally) standardised
+                    # scores so the teacher's ranking structure is on a usable scale.
+                    s_vec = _zscore(all_student) if normalize_distill else all_student
+                    t_vec = _zscore(all_teacher) if normalize_distill else all_teacher
                     if distill_component == "margin_mse":
-                        student_margin = pos_scores.unsqueeze(1) - neg_scores
-                        teacher_margin = teacher_pos.unsqueeze(1) - teacher_neg
+                        student_margin = s_vec[:, :1] - s_vec[:, 1:]
+                        teacher_margin = t_vec[:, :1] - t_vec[:, 1:]
                         loss_distill = F.mse_loss(student_margin, teacher_margin)
                     else:  # kl_div
-                        all_teacher = torch.cat([teacher_pos.unsqueeze(1), teacher_neg], dim=1)
-                        p_teacher = F.softmax(all_teacher / kl_temp, dim=-1)
-                        log_p_student = F.log_softmax(all_student / kl_temp, dim=-1)
+                        p_teacher = F.softmax(t_vec / kl_temp, dim=-1)
+                        log_p_student = F.log_softmax(s_vec / kl_temp, dim=-1)
                         loss_distill = F.kl_div(log_p_student, p_teacher, reduction="batchmean")
 
                     loss = ((1 - lambda_distill) * loss_contrastive + lambda_distill * loss_distill) / self.grad_accum
@@ -555,6 +586,11 @@ class Trainer:
         col_weight = float(dist_cfg.get("col_weight", 1.0))
         lambda_contrastive = float(dist_cfg.get("lambda_contrastive", 0.2))
         contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
+        # Per-row/col standardisation of teacher+student before the KL terms.
+        # The teacher matrix (qwen3vl_p_yes) is compressed to ~0.03-0.11, so its
+        # softmax is ~uniform (entropy ratio 1.0) and the KD signal vanishes;
+        # z-scoring restores usable structure. CE always uses raw cosine sims.
+        normalize_distill = bool(dist_cfg.get("normalize_scores", False))
 
         device = backbone.device
         total_loss = total_row = total_col = total_ce = 0.0
@@ -584,9 +620,19 @@ class Trainer:
                 # Student G x G cosine-similarity matrix per group
                 student = torch.bmm(q_emb, c_emb.transpose(1, 2))          # [B, G, G]
 
-                # row-wise KL: per query over candidates
-                s_rows = student.reshape(B * G, G)
+                # Raw cosine rows/cols (CE uses these; KL may use z-scored copies)
+                s_rows_raw = student.reshape(B * G, G)
+                s_cols_raw = student.transpose(1, 2).reshape(B * G, G)
                 t_rows = teacher.reshape(B * G, G)
+                t_cols = teacher.transpose(1, 2).reshape(B * G, G)
+
+                if normalize_distill:
+                    s_rows, t_rows = _zscore(s_rows_raw), _zscore(t_rows)
+                    s_cols, t_cols = _zscore(s_cols_raw), _zscore(t_cols)
+                else:
+                    s_rows, s_cols = s_rows_raw, s_cols_raw
+
+                # row-wise KL: per query over candidates
                 kl_row = F.kl_div(
                     F.log_softmax(s_rows / kl_temp, dim=-1),
                     F.softmax(t_rows / kl_temp, dim=-1),
@@ -594,17 +640,16 @@ class Trainer:
                 )
 
                 # col-wise KL: per candidate over queries (transpose first)
-                s_cols = student.transpose(1, 2).reshape(B * G, G)
-                t_cols = teacher.transpose(1, 2).reshape(B * G, G)
                 kl_col = F.kl_div(
                     F.log_softmax(s_cols / kl_temp, dim=-1),
                     F.softmax(t_cols / kl_temp, dim=-1),
                     reduction="batchmean",
                 )
 
-                # contrastive CE: diagonal is the positive within each group
+                # contrastive CE: diagonal is the positive within each group.
+                # Always on raw cosine sims — normalisation must not touch this.
                 labels = torch.arange(G, device=device).repeat(B)         # [B*G]
-                ce = F.cross_entropy(s_rows / contrastive_temp, labels)
+                ce = F.cross_entropy(s_rows_raw / contrastive_temp, labels)
 
                 loss = (
                     lambda_contrastive * ce
