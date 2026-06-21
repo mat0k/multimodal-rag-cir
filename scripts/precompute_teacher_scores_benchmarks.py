@@ -211,6 +211,22 @@ def _sample_negatives(
     return [int(j) for j in sample if j != idx][:n]
 
 
+def _sample_negatives_from_pool(
+    idx: int,
+    n: int,
+    pool: np.ndarray,
+    rng: np.random.Generator,
+) -> list[int]:
+    """Sample n negative indices from `pool` (global indices) excluding idx.
+
+    Used for single-domain negatives: pool is the set of triplet indices that
+    share the same source as `idx`. Returned indices are still global indices
+    into the full triplets list, so BenchmarkDistill resolves them unchanged.
+    """
+    sample = rng.choice(pool, size=min(n + 2, len(pool)), replace=False)
+    return [int(j) for j in sample if j != idx][:n]
+
+
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
@@ -294,12 +310,67 @@ def main(args: argparse.Namespace) -> None:
     triplets = _build_and_save_triplets(cfg, triplets_output)
     total = len(triplets)
 
-    # ── Pre-generate all negative index sets (deterministic) ────────────────
-    logger.info("Pre-generating negative sample indices …")
+    # Optional: restrict which triplets are scored (e.g. FashionIQ-only) and
+    # whether negatives are sampled within the same source (single-domain).
+    restrict_sources = dc.get("restrict_sources")            # None or list[str]
+    single_domain_negatives = bool(dc.get("single_domain_negatives", False))
+    skip_missing_images = bool(dc.get("skip_missing_images", True))
+
+    # Drop triplets whose ref OR pos image is absent on disk, from BOTH the
+    # score set and the negative pools. Negatives use the pos image of other
+    # triplets, so leaving missing-image triplets in the pool would cause many
+    # otherwise-valid triplets to be skipped (any one bad negative skips the
+    # whole triplet) and could crash the downstream BenchmarkDistill loader.
+    def _img_ok(tp: dict) -> bool:
+        base = cirr_images_dir if tp["source"] == "cirr" else fashioniq_images_dir
+        return (base / tp["ref_path"]).is_file() and (base / tp["pos_path"]).is_file()
+
+    if skip_missing_images:
+        valid = {i for i in range(total) if _img_ok(triplets[i])}
+        logger.info(
+            f"Image existence filter: {len(valid):,}/{total:,} triplets have "
+            f"both ref+pos images present"
+        )
+    else:
+        valid = set(range(total))
+
+    if restrict_sources:
+        allowed = set(restrict_sources)
+        score_indices = [
+            i for i in range(total)
+            if triplets[i]["source"] in allowed and i in valid
+        ]
+        logger.info(
+            f"Restricting to sources={sorted(allowed)} → "
+            f"{len(score_indices):,}/{total:,} triplets to score"
+        )
+    else:
+        score_indices = [i for i in range(total) if i in valid]
+
+    # ── Pre-generate negative index sets (deterministic) ────────────────────
+    logger.info(
+        f"Pre-generating negative sample indices "
+        f"(single_domain={single_domain_negatives}) …"
+    )
     rng_neg = np.random.default_rng(seed + 1)
-    neg_indices_all: list[list[int]] = [
-        _sample_negatives(i, num_negatives, total, rng_neg) for i in range(total)
-    ]
+    if single_domain_negatives:
+        # Pool of global indices per source (valid images only)
+        source_pools: dict[str, np.ndarray] = {}
+        for src in {triplets[i]["source"] for i in score_indices}:
+            source_pools[src] = np.array(
+                [i for i in range(total) if triplets[i]["source"] == src and i in valid]
+            )
+        neg_indices_map: dict[int, list[int]] = {
+            i: _sample_negatives_from_pool(
+                i, num_negatives, source_pools[triplets[i]["source"]], rng_neg
+            )
+            for i in score_indices
+        }
+    else:
+        neg_indices_map = {
+            i: _sample_negatives(i, num_negatives, total, rng_neg)
+            for i in score_indices
+        }
 
     # ── Load existing partial scores (resume support) ───────────────────────
     scores: dict[str, dict] = _load_existing_scores(scores_output)
@@ -316,12 +387,13 @@ def main(args: argparse.Namespace) -> None:
     scored_since_last_ckpt = 0
     t_start = time.time()
 
-    for i, triplet in enumerate(triplets):
+    for i in score_indices:
+        triplet = triplets[i]
         uid_str = str(triplet["uid"])
         if uid_str in scores:
             continue  # already scored — skip
 
-        neg_idx = neg_indices_all[i]
+        neg_idx = neg_indices_map[i]
         neg_triplets = [triplets[j] for j in neg_idx]
 
         try:
@@ -342,9 +414,10 @@ def main(args: argparse.Namespace) -> None:
             done = len(scores)
             elapsed = time.time() - t_start
             rate = elapsed / max(done - already_done, 1)
-            eta_h = (total - done) * rate / 3600
+            n_to_score = len(score_indices)
+            eta_h = (n_to_score - done) * rate / 3600
             logger.info(
-                f"Checkpoint | {done:,}/{total:,} scored | "
+                f"Checkpoint | {done:,}/{n_to_score:,} scored | "
                 f"rate={1/rate:.2f} triplets/s | ETA={eta_h:.1f}h"
             )
 

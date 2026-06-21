@@ -51,16 +51,18 @@ class BenchmarkDistill(Dataset):
         self,
         triplets_path: str,
         scores_path: str,
-        fashioniq_images_dir: str,
-        cirr_images_dir: str,
+        fashioniq_images_dir: Optional[str] = None,
+        cirr_images_dir: Optional[str] = None,
         image_transform: Optional[Callable] = None,
         caption_transform: Optional[Callable] = None,
         max_length_tokenizer: int = 77,
     ):
         super().__init__()
         self.name = "BenchmarkDistill"
-        self.fiq_dir = Path(fashioniq_images_dir)
-        self.cirr_dir = Path(cirr_images_dir)
+        # Only the dir(s) relevant to the scored sources need to be set; a
+        # single-domain run (FashionIQ-only / CIRR-only) specifies just its own.
+        self.fiq_dir = Path(fashioniq_images_dir) if fashioniq_images_dir else None
+        self.cirr_dir = Path(cirr_images_dir) if cirr_images_dir else None
         self.image_transform = image_transform
         self.caption_transform = caption_transform
         self.max_length_tokenizer = max_length_tokenizer
@@ -126,6 +128,11 @@ class BenchmarkDistill(Dataset):
 
     def _load_image(self, source: str, relative_path: str) -> torch.Tensor:
         base = self.cirr_dir if source == "cirr" else self.fiq_dir
+        if base is None:
+            raise ValueError(
+                f"No images_dir configured for source={source!r}. "
+                "Set the matching fashioniq_images_dir / cirr_images_dir."
+            )
         path = base / relative_path
         pil = Image.open(path).convert("RGB")
         if self.image_transform is not None:
@@ -136,8 +143,8 @@ class BenchmarkDistill(Dataset):
 def build_benchmark_distill_dataset(
     triplets_path: str,
     scores_path: str,
-    fashioniq_images_dir: str,
-    cirr_images_dir: str,
+    fashioniq_images_dir: Optional[str] = None,
+    cirr_images_dir: Optional[str] = None,
     image_transform: Optional[Callable] = None,
     caption_transform: Optional[Callable] = None,
     max_length_tokenizer: int = 77,

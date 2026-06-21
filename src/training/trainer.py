@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.lasco import build_lasco_dataset
+from src.datasets.benchmark_contrastive import build_benchmark_contrastive_dataset
 from src.datasets.lasco_distill import build_lasco_distill_dataset
 from src.datasets.lasco_relation_distill import build_lasco_relation_distill_dataset
 from src.datasets.benchmark_distill import build_benchmark_distill_dataset
@@ -111,8 +112,8 @@ def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader
         dataset = build_benchmark_distill_dataset(
             triplets_path=dc["triplets_path"],
             scores_path=dc["scores_path"],
-            fashioniq_images_dir=dc["fashioniq_images_dir"],
-            cirr_images_dir=dc["cirr_images_dir"],
+            fashioniq_images_dir=dc.get("fashioniq_images_dir"),
+            cirr_images_dir=dc.get("cirr_images_dir"),
             image_transform=image_transform,
             caption_transform=tokenize,
             max_length_tokenizer=77,
@@ -139,22 +140,38 @@ def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader
 
 def _build_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader:
     tc = cfg["training"]
-    dc = cfg["data"]["lasco"]
+    data_cfg = cfg["data"]
 
     image_transform = VistaImageProcessor(backbone.preprocess_train)
 
     def tokenize(text, **kwargs):
         return backbone.tokenizer(text, **kwargs)
 
-    dataset = build_lasco_dataset(
-        annotations_path=dc["annotations"],
-        images_dir=dc["images_dir"],
-        image_transform=image_transform,
-        caption_transform=tokenize,
-        max_length_tokenizer=77,
-    )
-
-    logger.info(f"LaSCo dataset loaded: {len(dataset):,} triplets")
+    if "benchmark_contrastive" in data_cfg:
+        dc = data_cfg["benchmark_contrastive"]
+        dataset = build_benchmark_contrastive_dataset(
+            triplets_path=dc["triplets_path"],
+            fashioniq_images_dir=dc.get("fashioniq_images_dir"),
+            cirr_images_dir=dc.get("cirr_images_dir"),
+            sources=dc.get("sources"),
+            image_transform=image_transform,
+            caption_transform=tokenize,
+            max_length_tokenizer=77,
+        )
+        logger.info(
+            f"Benchmark contrastive dataset loaded: {len(dataset):,} triplets "
+            f"(sources={dc.get('sources')})"
+        )
+    else:
+        dc = data_cfg["lasco"]
+        dataset = build_lasco_dataset(
+            annotations_path=dc["annotations"],
+            images_dir=dc["images_dir"],
+            image_transform=image_transform,
+            caption_transform=tokenize,
+            max_length_tokenizer=77,
+        )
+        logger.info(f"LaSCo dataset loaded: {len(dataset):,} triplets")
 
     return DataLoader(
         dataset,
