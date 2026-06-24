@@ -10,7 +10,7 @@ It REUSES the existing dataset readers and metric functions:
 and only swaps in LamRA-native encoding (src/retrievers/lamra_ret_retriever.py).
 
 Nothing in the VISTA path is touched. Results are written as JSON to
-results/lamra_ret_zeroshot/.
+results/lamra_ret/lamra_ret_zeroshot/.
 
 Usage (full run is GPU-heavy -> submit via jobs/retriever/eval_lamra_ret_a100.sbatch):
   python scripts/eval_lamra_ret.py --dataset both --batch-size 8
@@ -175,7 +175,7 @@ def main():
     ap.add_argument("--max-pixels", type=int, default=1280 * 28 * 28)
     ap.add_argument("--attn", default="sdpa", choices=["sdpa", "eager", "flash_attention_2"])
     ap.add_argument("--instruction", default=None, help="Override the composed-CIR instruction.")
-    ap.add_argument("--output-dir", default="results/lamra_ret_zeroshot")
+    ap.add_argument("--output-dir", default="results/lamra_ret/lamra_ret_zeroshot")
     ap.add_argument("--limit-queries", type=int, default=None, help="Smoke test: cap #queries.")
     ap.add_argument("--limit-index", type=int, default=None, help="Smoke test: cap #gallery imgs.")
     args = ap.parse_args()
@@ -195,7 +195,7 @@ def main():
     retriever = LamRARetRetriever(**kwargs)
     print(f"Loaded. <emb> id={retriever.emb_token_id}  instruction={retriever.cir_instruction!r}")
 
-    meta_base = {
+    meta = {
         "model_path": args.model_path,
         "instruction": retriever.cir_instruction,
         "min_pixels": args.min_pixels,
@@ -204,21 +204,28 @@ def main():
         "attn": args.attn,
         "limit_queries": args.limit_queries,
         "limit_index": args.limit_index,
+        "datasets": [],
     }
+
+    # Both benchmarks are evaluated in a single run and collected into ONE
+    # combined JSON (we always test on FashionIQ + CIRR, never train on them).
+    results: dict[str, dict] = {}
 
     if args.dataset in ("fashioniq", "both"):
         t0 = time.time()
         m = eval_fashioniq(retriever, args.batch_size, args.limit_queries, args.limit_index)
         print("FashionIQ:", json.dumps(m, indent=2))
-        _save(m, {**meta_base, "dataset": "fashioniq", "elapsed_s": round(time.time() - t0, 1)},
-              out_dir / "fashioniq.json")
+        results["fashioniq"] = {"metrics": m, "elapsed_s": round(time.time() - t0, 1)}
+        meta["datasets"].append("fashioniq")
 
     if args.dataset in ("cirr", "both"):
         t0 = time.time()
         m = eval_cirr(retriever, args.batch_size, args.limit_queries, args.limit_index)
         print("CIRR:", json.dumps(m, indent=2))
-        _save(m, {**meta_base, "dataset": "cirr", "elapsed_s": round(time.time() - t0, 1)},
-              out_dir / "cirr.json")
+        results["cirr"] = {"metrics": m, "elapsed_s": round(time.time() - t0, 1)}
+        meta["datasets"].append("cirr")
+
+    _save(results, meta, out_dir / "zeroshot_fiq_cirr.json")
 
 
 if __name__ == "__main__":
