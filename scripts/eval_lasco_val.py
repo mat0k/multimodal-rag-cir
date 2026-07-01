@@ -135,7 +135,7 @@ def _save_result(
 
 def main(args: argparse.Namespace) -> None:
     run_name = args.run_name
-    output_dir = PROJECT_ROOT / "results" / "lasco_val" / run_name
+    output_dir = PROJECT_ROOT / args.output_root / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     _setup_logging(output_dir)
@@ -185,6 +185,8 @@ if __name__ == "__main__":
     group.add_argument("--zero_shot", action="store_true", help="Evaluate base model without fine-tuning.")
     group.add_argument("--checkpoint", type=str, help="Path to fine-tuned .pth checkpoint.")
     parser.add_argument("--run_name", type=str, required=True, help="Name for the output directory.")
+    parser.add_argument("--output_root", type=str, default="results/lasco_val",
+                        help="Root dir (relative to repo) under which run_name is created.")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--k", type=int, nargs="+", default=[1, 5, 10, 50, 100],
