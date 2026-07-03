@@ -21,12 +21,15 @@ from src.datasets.lasco import build_lasco_dataset
 from src.datasets.benchmark_contrastive import build_benchmark_contrastive_dataset
 from src.datasets.lasco_distill import build_lasco_distill_dataset
 from src.datasets.lasco_relation_distill import build_lasco_relation_distill_dataset
+from src.datasets.lasco_sp_distill import build_lasco_sp_distill_dataset
 from src.datasets.benchmark_distill import build_benchmark_distill_dataset
 from src.retrievers.backbones.vista.modeling import Visualized_BGE
 from src.retrievers.vista_retriever import VistaImageProcessor
 from src.training.collator import LaSCoCollator
 from src.training.distill_collator import DistillCollator
 from src.training.relation_collator import RelationCollator
+from src.training.cluster_batch_sampler import ClusterBatchSampler
+from src.training.sp_collator import SPCollator
 from src.utils.io import save_to_json
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,38 @@ def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader
 
     def tokenize(text, **kwargs):
         return backbone.tokenizer(text, **kwargs)
+
+    if "lasco_sp_distill" in data_cfg:
+        dc = data_cfg["lasco_sp_distill"]
+        dataset = build_lasco_sp_distill_dataset(
+            subset_path=dc["subset_path"],
+            teacher_cand_emb_path=dc["teacher_cand_emb_path"],
+            images_dir=dc["images_dir"],
+            cluster_labels_path=dc.get("cluster_labels_path"),  # None -> random floor
+            image_transform=image_transform,
+            caption_transform=tokenize,
+            max_length_tokenizer=77,
+        )
+        sampler = ClusterBatchSampler(
+            cluster_ids=dataset.cluster_ids,
+            batch_size=tc["batch_size"],
+            n_items=len(dataset),
+            shuffle=True,
+            seed=cfg.get("seed", 42),
+        )
+        logger.info(
+            f"LaSCo SP distill dataset loaded: {len(dataset):,} pairs | "
+            f"{len(sampler):,} cluster-batches of size {tc['batch_size']} "
+            f"({'random floor' if dataset.cluster_ids is None else 'clustered'})"
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=tc["num_workers"],
+            collate_fn=SPCollator(),
+            pin_memory=True,
+            persistent_workers=tc["num_workers"] > 0,
+        )
 
     if "lasco_relation_distill" in data_cfg:
         dc = data_cfg["lasco_relation_distill"]
@@ -431,6 +466,11 @@ class Trainer:
                 backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
             )
 
+        if loss_type == "sp":
+            return self._sp_train_epoch(
+                backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
+            )
+
         kl_temp = float(dist_cfg.get("kl_temperature", 1.0))
         lambda_distill = float(dist_cfg.get("lambda_distill", 0.5))
         contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
@@ -706,6 +746,121 @@ class Trainer:
             f"[Epoch {epoch:02d}] relation_avg_loss={avg_loss:.4f}  "
             f"row_kl={result['avg_row_kl']:.4f}  col_kl={result['avg_col_kl']:.4f}  "
             f"ce={result['avg_contrastive_loss']:.4f}"
+        )
+        return result
+
+    def _sp_train_epoch(
+        self,
+        backbone: Visualized_BGE,
+        loader: DataLoader,
+        optimizer: AdamW,
+        scheduler: Any,
+        epoch: int,
+        steps_per_epoch: int,
+    ) -> dict[str, float]:
+        """Similarity-Preserving (SP) relation distillation (Tung & Mori, ICCV'19).
+
+        Each batch is N (query, target) pairs from ONE semantic cluster. We distil
+        the teacher's candidate x candidate similarity STRUCTURE into the student:
+
+          A        = student target embeddings            [N, d_student]
+          A_t      = teacher target embeddings (cached)    [N, d_teacher]
+          G  = rownorm_L2(A  @ A^T)                         [N, N]
+          G_t= rownorm_L2(A_t @ A_t^T)                      [N, N]
+          L_SP = || G_t - G ||_F^2 / N^2
+
+        Plus a supervised CE anchor on TRUE positives (never dropped):
+          CE(query_i -> target_i), in-batch negatives, with known-duplicate
+          positives masked out so we never push apart labelled-equivalent images.
+
+          L = lambda_ce * CE + sp_weight * L_SP
+
+        False-negative meter: per batch we log how many in-batch negatives have
+        teacher-cosine > fn_threshold to the query's true target (watched against
+        the recall curve as clustering tightens).
+        """
+        dist_cfg = self.cfg.get("distillation", {})
+        sp_weight = float(dist_cfg.get("sp_weight", 1.0))
+        lambda_ce = float(dist_cfg.get("lambda_contrastive", 1.0))
+        contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
+        fn_threshold = float(dist_cfg.get("fn_threshold", 0.8))
+
+        device = backbone.device
+        total_loss = total_sp = total_ce = 0.0
+        total_fn = 0.0  # avg fraction of in-batch negatives above fn_threshold
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(loader, start=1):
+            ref_images = batch.ref_images.to(device, non_blocking=True)       # [N, C, H, W]
+            target_images = batch.target_images.to(device, non_blocking=True) # [N, C, H, W]
+            texts = {
+                "input_ids": batch.input_ids.to(device, non_blocking=True),
+                "attention_mask": batch.attention_mask.to(device, non_blocking=True),
+            }
+            teacher_t = batch.teacher_target_emb.to(device, non_blocking=True)  # [N, d_teacher]
+            N = teacher_t.shape[0]
+
+            # duplicate-positive mask: target_j is also a positive for query_i.
+            ids = batch.target_ids
+            dup = torch.zeros(N, N, dtype=torch.bool, device=device)
+            for i in range(N):
+                for j in range(N):
+                    if i != j and ids[i] == ids[j]:
+                        dup[i, j] = True
+
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                q_emb = backbone.encode_mm(ref_images, texts)      # [N, d_student] (L2-normed)
+                c_emb = backbone.encode_image(target_images)        # [N, d_student] (L2-normed)
+
+                # --- CE anchor on true positives (mask known-duplicate positives) ---
+                logits = (q_emb @ c_emb.T) / contrastive_temp       # [N, N]
+                logits = logits.masked_fill(dup, float("-inf"))
+                labels = torch.arange(N, device=device)
+                ce = F.cross_entropy(logits, labels)
+
+                # --- SP: candidate-candidate structure (row-normalised Gram) ---
+                G_s = F.normalize(c_emb @ c_emb.T, p=2, dim=1)       # [N, N]
+                G_t = F.normalize(teacher_t @ teacher_t.T, p=2, dim=1)
+                sp = ((G_t - G_s) ** 2).sum() / (N * N)
+
+                loss = (lambda_ce * ce + sp_weight * sp) / self.grad_accum
+
+            loss.backward()
+            total_loss += loss.item() * self.grad_accum
+            total_sp += sp.item()
+            total_ce += ce.item()
+
+            # false-negative meter (teacher cosine of negatives to the true target)
+            with torch.no_grad():
+                t_sim = teacher_t @ teacher_t.T                     # [N, N] teacher cosine
+                offdiag = ~torch.eye(N, dtype=torch.bool, device=device)
+                fn_frac = ((t_sim > fn_threshold) & offdiag).float().sum() / max(N * (N - 1), 1)
+                total_fn += float(fn_frac)
+
+            if step % self.grad_accum == 0 or step == steps_per_epoch:
+                torch.nn.utils.clip_grad_norm_(backbone.parameters(), self.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            if step % self.log_every == 0:
+                lr = scheduler.get_last_lr()[0]
+                logger.info(
+                    f"[Epoch {epoch:02d} | Step {step:05d}/{steps_per_epoch}] "
+                    f"sp_loss={loss.item() * self.grad_accum:.4f}  sp={sp.item():.4f}  "
+                    f"ce={ce.item():.4f}  fn_frac={float(fn_frac):.3f}  lr={lr:.2e}"
+                )
+
+        result = {
+            "avg_loss": total_loss / steps_per_epoch,
+            "avg_sp": total_sp / steps_per_epoch,
+            "avg_contrastive_loss": total_ce / steps_per_epoch,
+            "avg_false_neg_frac": total_fn / steps_per_epoch,
+        }
+        logger.info(
+            f"[Epoch {epoch:02d}] sp_avg_loss={result['avg_loss']:.4f}  "
+            f"sp={result['avg_sp']:.4f}  ce={result['avg_contrastive_loss']:.4f}  "
+            f"false_neg_frac={result['avg_false_neg_frac']:.3f}"
         )
         return result
 
