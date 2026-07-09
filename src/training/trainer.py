@@ -471,6 +471,11 @@ class Trainer:
                 backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
             )
 
+        if loss_type == "rkd":
+            return self._rkd_train_epoch(
+                backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
+            )
+
         kl_temp = float(dist_cfg.get("kl_temperature", 1.0))
         lambda_distill = float(dist_cfg.get("lambda_distill", 0.5))
         contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
@@ -861,6 +866,113 @@ class Trainer:
             f"[Epoch {epoch:02d}] sp_avg_loss={result['avg_loss']:.4f}  "
             f"sp={result['avg_sp']:.4f}  ce={result['avg_contrastive_loss']:.4f}  "
             f"false_neg_frac={result['avg_false_neg_frac']:.3f}"
+        )
+        return result
+
+    def _rkd_train_epoch(
+        self,
+        backbone: Visualized_BGE,
+        loader: DataLoader,
+        optimizer: AdamW,
+        scheduler: Any,
+        epoch: int,
+        steps_per_epoch: int,
+    ) -> dict[str, float]:
+        """Relational Knowledge Distillation (Park et al., CVPR'19) — the canonical
+        SECOND relation-based method, over the batch's target images.
+
+        Distills the teacher's mutual relations between candidate images via:
+          - distance-wise : match mean-normalised pairwise distances
+          - angle-wise    : match triplet angles  cos<e_ij, e_kj>,  e_ij = norm(v_i - v_j)
+        Both use smooth-L1 (Huber). Same supervised CE anchor on TRUE positives as SP.
+
+          L = lambda_ce * CE + dist_weight * L_dist + angle_weight * L_angle
+
+        Reuses the SP dataset/collator (target images + cached teacher embeddings).
+        """
+        dist_cfg = self.cfg.get("distillation", {})
+        w_dist = float(dist_cfg.get("rkd_dist_weight", 25.0))
+        w_angle = float(dist_cfg.get("rkd_angle_weight", 50.0))
+        lambda_ce = float(dist_cfg.get("lambda_contrastive", 1.0))
+        contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
+
+        def _rkd_distance(s: torch.Tensor, t: torch.Tensor, off: torch.Tensor) -> torch.Tensor:
+            ds, dt = torch.cdist(s, s), torch.cdist(t, t)
+            ds = ds / ds[off].mean().clamp_min(1e-6)
+            dt = dt / dt[off].mean().clamp_min(1e-6)
+            return F.smooth_l1_loss(ds[off], dt[off])
+
+        def _rkd_angle(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            def ang(x):
+                e = F.normalize(x.unsqueeze(0) - x.unsqueeze(1), dim=-1)  # e[i,j]=norm(x_i-x_j) [N,N,d]
+                return torch.einsum("ijd,kjd->ijk", e, e)                 # <e_ij, e_kj>
+            return F.smooth_l1_loss(ang(s.float()), ang(t.float()))
+
+        device = backbone.device
+        total_loss = total_ce = total_d = total_a = 0.0
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(loader, start=1):
+            ref = batch.ref_images.to(device, non_blocking=True)
+            tgt = batch.target_images.to(device, non_blocking=True)
+            texts = {
+                "input_ids": batch.input_ids.to(device, non_blocking=True),
+                "attention_mask": batch.attention_mask.to(device, non_blocking=True),
+            }
+            teacher = batch.teacher_target_emb.to(device, non_blocking=True)  # [N, d_t]
+            N = teacher.shape[0]
+            off = ~torch.eye(N, dtype=torch.bool, device=device)
+
+            ids = batch.target_ids
+            dup = torch.zeros(N, N, dtype=torch.bool, device=device)
+            for i in range(N):
+                for j in range(N):
+                    if i != j and ids[i] == ids[j]:
+                        dup[i, j] = True
+
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                q = backbone.encode_mm(ref, texts)     # [N, d_s]
+                c = backbone.encode_image(tgt)          # [N, d_s]
+
+                logits = (q @ c.T) / contrastive_temp
+                logits = logits.masked_fill(dup, float("-inf"))
+                ce = F.cross_entropy(logits, torch.arange(N, device=device))
+
+                l_dist = _rkd_distance(c.float(), teacher.float(), off)
+                l_angle = _rkd_angle(c, teacher)
+
+                loss = (lambda_ce * ce + w_dist * l_dist + w_angle * l_angle) / self.grad_accum
+
+            loss.backward()
+            total_loss += loss.item() * self.grad_accum
+            total_ce += ce.item()
+            total_d += l_dist.item()
+            total_a += l_angle.item()
+
+            if step % self.grad_accum == 0 or step == steps_per_epoch:
+                torch.nn.utils.clip_grad_norm_(backbone.parameters(), self.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            if step % self.log_every == 0:
+                lr = scheduler.get_last_lr()[0]
+                logger.info(
+                    f"[Epoch {epoch:02d} | Step {step:05d}/{steps_per_epoch}] "
+                    f"rkd_loss={loss.item() * self.grad_accum:.4f}  ce={ce.item():.4f}  "
+                    f"dist={l_dist.item():.4f}  angle={l_angle.item():.4f}  lr={lr:.2e}"
+                )
+
+        result = {
+            "avg_loss": total_loss / steps_per_epoch,
+            "avg_contrastive_loss": total_ce / steps_per_epoch,
+            "avg_rkd_dist": total_d / steps_per_epoch,
+            "avg_rkd_angle": total_a / steps_per_epoch,
+        }
+        logger.info(
+            f"[Epoch {epoch:02d}] rkd_avg_loss={result['avg_loss']:.4f}  "
+            f"ce={result['avg_contrastive_loss']:.4f}  dist={result['avg_rkd_dist']:.4f}  "
+            f"angle={result['avg_rkd_angle']:.4f}"
         )
         return result
 

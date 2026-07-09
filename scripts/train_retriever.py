@@ -188,6 +188,8 @@ def main(args: argparse.Namespace) -> None:
         cfg["training"]["learning_rate"] = args.lr
     if args.run_name is not None:
         cfg["outputs"]["run_name"] = args.run_name
+    if args.seed is not None:
+        cfg["seed"] = args.seed
     if args.from_pretrained is not None:
         cfg["model"]["from_pretrained"] = args.from_pretrained
     if args.teacher_scores is not None:
@@ -230,6 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch size.")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate.")
     parser.add_argument("--run_name", type=str, default=None, help="Override output run name.")
+    parser.add_argument("--seed", type=int, default=None, help="Override cfg seed (init + data/batch RNG).")
     parser.add_argument("--from_pretrained", type=str, default=None, help="Override model.from_pretrained (start training from this checkpoint).")
     parser.add_argument("--teacher_scores", type=str, default=None, help="Override distillation.soft_labels_path and data.benchmark_distill.scores_path.")
 
