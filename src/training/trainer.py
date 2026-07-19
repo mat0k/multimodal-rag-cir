@@ -90,6 +90,8 @@ def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader
             n_items=len(dataset),
             shuffle=True,
             seed=cfg.get("seed", 42),
+            target_ids=dataset.target_ids,
+            unique_per_batch=bool(dc.get("unique_per_batch", False)),
         )
         logger.info(
             f"LaSCo SP distill dataset loaded: {len(dataset):,} pairs | "
@@ -224,17 +226,33 @@ def _build_optimizer_and_scheduler(
     backbone: Visualized_BGE,
     cfg: dict,
     total_steps: int,
+    extra_params: list | None = None,
+    extra_lr: float | None = None,
 ) -> tuple[AdamW, Any]:
     tc = cfg["training"]
     warmup_steps = int(total_steps * tc["warmup_ratio"])
 
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, backbone.parameters()),
-        lr=tc["learning_rate"],
-        weight_decay=tc["weight_decay"],
-        betas=(0.9, 0.999),
-        eps=1e-8,
-    )
+    base = list(filter(lambda p: p.requires_grad, backbone.parameters()))
+    if extra_params:
+        # Separate param group: freshly-init CRD projection heads need a much
+        # higher lr than the pretrained backbone (1e-6 barely moves a new MLP).
+        e_lr = extra_lr if extra_lr is not None else tc["learning_rate"]
+        optimizer = AdamW(
+            [
+                {"params": base, "lr": tc["learning_rate"]},
+                {"params": list(extra_params), "lr": e_lr},
+            ],
+            weight_decay=tc["weight_decay"], betas=(0.9, 0.999), eps=1e-8,
+        )
+        logger.info(f"Optimizer: 2 param groups — backbone lr={tc['learning_rate']}  projector lr={e_lr}")
+    else:
+        optimizer = AdamW(
+            base,
+            lr=tc["learning_rate"],
+            weight_decay=tc["weight_decay"],
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -341,8 +359,31 @@ class Trainer:
         steps_per_epoch = len(loader)
         total_steps = steps_per_epoch * self.cfg["training"]["epochs"] // self.grad_accum
 
+        # CRD needs trainable projection heads (student/teacher -> shared space),
+        # optimised alongside the backbone. Built only for loss: crd.
+        extra_params = None
+        extra_lr = None
+        self.crd_projector = None
+        if self.cfg.get("distillation", {}).get("loss") == "crd":
+            from src.training.crd_projector import CRDProjector
+            dcfg = self.cfg["distillation"]
+            self.crd_projector = CRDProjector(
+                student_dim=int(dcfg.get("student_dim", 768)),
+                teacher_dim=int(dcfg.get("teacher_dim", 3584)),
+                proj_dim=int(dcfg.get("projection_dim", 128)),
+                student_head=dcfg.get("student_projector", "mlp"),
+                teacher_head=dcfg.get("teacher_projector", "mlp"),
+            ).to(backbone.device)
+            self.crd_projector.train()
+            extra_params = list(self.crd_projector.parameters())
+            extra_lr = float(dcfg.get("projector_lr", 1.0e-3))
+            logger.info(
+                f"CRD projector built: proj_dim={dcfg.get('projection_dim', 128)}  "
+                f"projector_lr={extra_lr}"
+            )
+
         optimizer, scheduler = _build_optimizer_and_scheduler(
-            backbone, self.cfg, total_steps
+            backbone, self.cfg, total_steps, extra_params=extra_params, extra_lr=extra_lr
         )
 
         logger.info(
@@ -473,6 +514,11 @@ class Trainer:
 
         if loss_type == "rkd":
             return self._rkd_train_epoch(
+                backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
+            )
+
+        if loss_type == "crd":
+            return self._crd_train_epoch(
                 backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
             )
 
@@ -973,6 +1019,105 @@ class Trainer:
             f"[Epoch {epoch:02d}] rkd_avg_loss={result['avg_loss']:.4f}  "
             f"ce={result['avg_contrastive_loss']:.4f}  dist={result['avg_rkd_dist']:.4f}  "
             f"angle={result['avg_rkd_angle']:.4f}"
+        )
+        return result
+
+    def _crd_train_epoch(
+        self,
+        backbone: Visualized_BGE,
+        loader: DataLoader,
+        optimizer: AdamW,
+        scheduler: Any,
+        epoch: int,
+        steps_per_epoch: int,
+    ) -> dict[str, float]:
+        """Contrastive Representation Distillation (Tian et al., ICLR'20).
+
+        Cross-network per-instance alignment: the student's rep of a target image
+        should agree with the TEACHER's rep of the SAME image (positive) and
+        disagree with the teacher's reps of OTHER images (negatives) — an InfoNCE
+        objective that maximises I(teacher; student). Both reps are pushed through
+        trainable projection heads into a shared space (self.crd_projector).
+
+        v1 uses in-batch negatives (N-1 per anchor); the frozen teacher buffer can
+        extend this later. Same supervised CE anchor on TRUE positives as SP/RKD.
+
+          L = lambda_ce * CE + crd_weight * InfoNCE(student_i <-> teacher_i)
+        """
+        dist_cfg = self.cfg.get("distillation", {})
+        crd_weight = float(dist_cfg.get("crd_weight", 1.0))
+        crd_temp = float(dist_cfg.get("crd_temperature", 0.07))
+        lambda_ce = float(dist_cfg.get("lambda_contrastive", 1.0))
+        contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
+        proj = self.crd_projector
+
+        device = backbone.device
+        total_loss = total_ce = total_crd = 0.0
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(loader, start=1):
+            ref = batch.ref_images.to(device, non_blocking=True)
+            tgt = batch.target_images.to(device, non_blocking=True)
+            texts = {
+                "input_ids": batch.input_ids.to(device, non_blocking=True),
+                "attention_mask": batch.attention_mask.to(device, non_blocking=True),
+            }
+            teacher = batch.teacher_target_emb.to(device, non_blocking=True)  # [N, d_t]
+            N = teacher.shape[0]
+
+            ids = batch.target_ids
+            dup = torch.zeros(N, N, dtype=torch.bool, device=device)
+            for i in range(N):
+                for j in range(N):
+                    if i != j and ids[i] == ids[j]:
+                        dup[i, j] = True
+            labels = torch.arange(N, device=device)
+
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                q = backbone.encode_mm(ref, texts)     # [N, d_s]
+                c = backbone.encode_image(tgt)          # [N, d_s]
+
+                # CE anchor (retrieval): query_i -> target_i, dup positives masked.
+                ce_logits = (q @ c.T) / contrastive_temp
+                ce_logits = ce_logits.masked_fill(dup, float("-inf"))
+                ce = F.cross_entropy(ce_logits, labels)
+
+                # CRD InfoNCE: student_i rep vs teacher_j reps (positive = j==i).
+                z_s = proj.project_student(c).float()          # [N, p]
+                z_t = proj.project_teacher(teacher).float()    # [N, p]
+                crd_logits = (z_s @ z_t.T) / crd_temp          # [N, N]
+                crd_logits = crd_logits.masked_fill(dup, float("-inf"))
+                crd = F.cross_entropy(crd_logits, labels)
+
+                loss = (lambda_ce * ce + crd_weight * crd) / self.grad_accum
+
+            loss.backward()
+            total_loss += loss.item() * self.grad_accum
+            total_ce += ce.item()
+            total_crd += crd.item()
+
+            if step % self.grad_accum == 0 or step == steps_per_epoch:
+                torch.nn.utils.clip_grad_norm_(backbone.parameters(), self.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            if step % self.log_every == 0:
+                lr = scheduler.get_last_lr()[0]
+                logger.info(
+                    f"[Epoch {epoch:02d} | Step {step:05d}/{steps_per_epoch}] "
+                    f"crd_loss={loss.item() * self.grad_accum:.4f}  ce={ce.item():.4f}  "
+                    f"crd={crd.item():.4f}  lr={lr:.2e}"
+                )
+
+        result = {
+            "avg_loss": total_loss / steps_per_epoch,
+            "avg_contrastive_loss": total_ce / steps_per_epoch,
+            "avg_crd": total_crd / steps_per_epoch,
+        }
+        logger.info(
+            f"[Epoch {epoch:02d}] crd_avg_loss={result['avg_loss']:.4f}  "
+            f"ce={result['avg_contrastive_loss']:.4f}  crd={result['avg_crd']:.4f}"
         )
         return result
 

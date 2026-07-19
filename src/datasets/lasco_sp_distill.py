@@ -47,6 +47,10 @@ class LaSCoSPDistill(Dataset):
         with open(subset_path, "r") as f:
             self.subset: list[dict] = json.load(f)
 
+        # Target image id per sample — used by ClusterBatchSampler to enforce
+        # unique target images within a batch (de-dup control).
+        self.target_ids: list[str] = [t["target-image"][1] for t in self.subset]
+
         # Cached teacher target embeddings, aligned to subset order.
         self.teacher_emb: torch.Tensor = torch.load(teacher_cand_emb_path, map_location="cpu").float()
         self.teacher_emb = torch.nn.functional.normalize(self.teacher_emb, dim=-1)

@@ -22,11 +22,16 @@ class ClusterBatchSampler:
         n_items: Optional[int] = None,
         shuffle: bool = True,
         seed: int = 42,
+        target_ids: Optional[list] = None,
+        unique_per_batch: bool = False,
     ):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.epoch = 0
         self._seed = seed
+        # De-dup control: enforce distinct target images within each batch.
+        self.target_ids = target_ids
+        self.unique_per_batch = bool(unique_per_batch and target_ids is not None)
 
         if cluster_ids is None:
             if n_items is None:
@@ -38,7 +43,13 @@ class ClusterBatchSampler:
                 buckets[c].append(idx)
             self.clusters = dict(buckets)
 
-        self._num_batches = sum(len(v) // batch_size for v in self.clusters.values())
+        if self.unique_per_batch:
+            # batches are formed from UNIQUE target images per cluster
+            self._num_batches = sum(
+                len({self.target_ids[i] for i in v}) // batch_size for v in self.clusters.values()
+            )
+        else:
+            self._num_batches = sum(len(v) // batch_size for v in self.clusters.values())
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -53,6 +64,15 @@ class ClusterBatchSampler:
             items = list(members)
             if self.shuffle:
                 rng.shuffle(items)
+            if self.unique_per_batch:
+                # keep first index of each unique target (post-shuffle -> varies per epoch)
+                seen, deduped = set(), []
+                for i in items:
+                    tid = self.target_ids[i]
+                    if tid not in seen:
+                        seen.add(tid)
+                        deduped.append(i)
+                items = deduped
             n_full = len(items) // self.batch_size
             for b in range(n_full):
                 batches.append(items[b * self.batch_size : (b + 1) * self.batch_size])
