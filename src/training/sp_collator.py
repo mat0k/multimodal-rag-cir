@@ -25,10 +25,13 @@ class SPBatch:
     teacher_target_emb: Tensor
     target_ids: list
     qids: Tensor
+    # Feature-based KD only (query-side embedding matching). None for SP/RKD/CRD.
+    teacher_query_emb: Tensor | None = None
 
 
 class SPCollator:
     def __call__(self, samples: list[dict]) -> SPBatch:
+        has_q = "teacher_query_emb" in samples[0]
         return SPBatch(
             ref_images=torch.stack([s["ref_image"] for s in samples]),
             target_images=torch.stack([s["target_image"] for s in samples]),
@@ -37,4 +40,7 @@ class SPCollator:
             teacher_target_emb=torch.stack([s["teacher_target_emb"] for s in samples]),
             target_ids=[s["target_id"] for s in samples],
             qids=torch.tensor([s["qid"] for s in samples], dtype=torch.long),
+            teacher_query_emb=(
+                torch.stack([s["teacher_query_emb"] for s in samples]) if has_q else None
+            ),
         )

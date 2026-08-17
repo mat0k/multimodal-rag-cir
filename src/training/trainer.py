@@ -83,6 +83,8 @@ def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader
             image_transform=image_transform,
             caption_transform=tokenize,
             max_length_tokenizer=77,
+            # Feature-based KD only; None leaves SP/RKD/CRD behaviour unchanged.
+            teacher_query_emb_path=dc.get("teacher_query_emb_path"),
         )
         sampler = ClusterBatchSampler(
             cluster_ids=dataset.cluster_ids,
@@ -382,6 +384,41 @@ class Trainer:
                 f"projector_lr={extra_lr}"
             )
 
+        # Feature-based KD (FitNets/EmbedDistill-style embedding matching).
+        # mode="up"  -> trainable Linear(student -> teacher), alignment in teacher space.
+        # mode="none"-> teacher pre-projected offline to student dim; ZERO trainable
+        #               projection, so the loss lands on the student's native
+        #               retrieval embedding and absorption is impossible.
+        self.feature_projector = None
+        if self.cfg.get("distillation", {}).get("loss") == "feature":
+            from src.training.feature_projector import FeatureProjector
+            dcfg = self.cfg["distillation"]
+            # Never hardcode the teacher dim: read it off the cache actually loaded.
+            teacher_dim = int(loader.dataset.teacher_emb.shape[-1])
+            student_dim = int(dcfg.get("student_dim", 768))
+            mode = dcfg.get("feature_mode", "up")
+            self.feature_projector = FeatureProjector(
+                student_dim=student_dim,
+                teacher_dim=teacher_dim,
+                mode=mode,
+                head=dcfg.get("feature_head", "linear"),
+            ).to(backbone.device)
+            self.feature_projector.train()
+            n_proj = sum(p.numel() for p in self.feature_projector.parameters())
+            if self.feature_projector.has_params:
+                extra_params = list(self.feature_projector.parameters())
+                extra_lr = float(dcfg.get("projector_lr", 1.0e-3))
+            logger.info(
+                f"Feature projector built: mode={mode} head={dcfg.get('feature_head','linear')} "
+                f"student_dim={student_dim} teacher_dim={teacher_dim} (read from cache) "
+                f"params={n_proj:,} projector_lr={extra_lr}"
+            )
+            if loader.dataset.teacher_query_emb is None:
+                logger.warning(
+                    "feature KD: no teacher_query_emb_path set — query-side matching "
+                    "will be SKIPPED (candidate-side only)."
+                )
+
         optimizer, scheduler = _build_optimizer_and_scheduler(
             backbone, self.cfg, total_steps, extra_params=extra_params, extra_lr=extra_lr
         )
@@ -524,6 +561,11 @@ class Trainer:
 
         if loss_type == "relation_joint":
             return self._relation_joint_train_epoch(
+                backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
+            )
+
+        if loss_type == "feature":
+            return self._feature_train_epoch(
                 backbone, loader, optimizer, scheduler, epoch, steps_per_epoch
             )
 
@@ -1123,6 +1165,134 @@ class Trainer:
         logger.info(
             f"[Epoch {epoch:02d}] crd_avg_loss={result['avg_loss']:.4f}  "
             f"ce={result['avg_contrastive_loss']:.4f}  crd={result['avg_crd']:.4f}"
+        )
+        return result
+
+    def _feature_train_epoch(
+        self,
+        backbone: Visualized_BGE,
+        loader: DataLoader,
+        optimizer: AdamW,
+        scheduler: Any,
+        epoch: int,
+        steps_per_epoch: int,
+    ) -> dict[str, float]:
+        """FEATURE-based distillation — embedding matching (FitNets / EmbedDistill).
+
+        Unlike SP/RKD (which match *relative* structure and are invariant to any
+        rotation of the space), this pins the student's embedding to the teacher's
+        ABSOLUTE coordinates — a strictly stronger constraint.
+
+          L = lambda_ce * CE  +  feat_weight * ( ||q_hat - q_t||^2 + ||c_hat - c_t||^2 )
+
+        where ||.||^2 is summed over dims and averaged over the batch, so with both
+        sides L2-normalized it equals 2 - 2*cos in [0, 4] — dimension-independent,
+        which keeps feat_weight sane (see feature_projector.squared_l2).
+
+        Two modes, opposed by design to diagnose projector ABSORPTION:
+          up   : q_hat = normalize(W_q @ q_s) in TEACHER space (trainable head).
+          none : q_hat = q_s, the student's NATIVE retrieval embedding, matched
+                 against an offline-projected teacher. No trainable projection,
+                 so the head cannot absorb the alignment.
+
+        Logged per step: the two loss terms AND the mean student-teacher cosine,
+        so absorption (feat loss falling while recall stays flat) is visible early.
+        """
+        from src.training.feature_projector import squared_l2
+
+        dist_cfg = self.cfg.get("distillation", {})
+        feat_weight = float(dist_cfg.get("feat_weight", 1.0))
+        lambda_ce = float(dist_cfg.get("lambda_contrastive", 1.0))
+        contrastive_temp = float(dist_cfg.get("contrastive_temperature", 0.02))
+        align_query = bool(dist_cfg.get("align_query", True))
+        align_cand = bool(dist_cfg.get("align_candidate", True))
+        proj = self.feature_projector
+
+        device = backbone.device
+        total_loss = total_ce = total_feat = 0.0
+        total_cos_q = total_cos_c = 0.0
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(loader, start=1):
+            ref = batch.ref_images.to(device, non_blocking=True)
+            tgt = batch.target_images.to(device, non_blocking=True)
+            texts = {
+                "input_ids": batch.input_ids.to(device, non_blocking=True),
+                "attention_mask": batch.attention_mask.to(device, non_blocking=True),
+            }
+            t_cand = batch.teacher_target_emb.to(device, non_blocking=True)   # [N, d_t]
+            t_query = (
+                batch.teacher_query_emb.to(device, non_blocking=True)
+                if batch.teacher_query_emb is not None else None
+            )
+            N = t_cand.shape[0]
+
+            ids = batch.target_ids
+            dup = torch.zeros(N, N, dtype=torch.bool, device=device)
+            for i in range(N):
+                for j in range(N):
+                    if i != j and ids[i] == ids[j]:
+                        dup[i, j] = True
+            labels = torch.arange(N, device=device)
+
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                q = backbone.encode_mm(ref, texts)      # [N, d_s] (L2-normed)
+                c = backbone.encode_image(tgt)          # [N, d_s]
+
+                # CE anchor on TRUE positives — kept in every arm, never dropped.
+                ce_logits = (q @ c.T) / contrastive_temp
+                ce_logits = ce_logits.masked_fill(dup, float("-inf"))
+                ce = F.cross_entropy(ce_logits, labels)
+
+                # Embedding matching. In mode="none" project_* is identity, so the
+                # loss lands on exactly the embedding retrieval uses.
+                feat = q.new_zeros(())
+                cos_q = cos_c = 0.0
+                if align_cand:
+                    c_hat = proj.project_candidate(c).float()
+                    tc = F.normalize(t_cand.float(), dim=-1)
+                    feat = feat + squared_l2(c_hat, tc)
+                    cos_c = float((c_hat * tc).sum(-1).mean())
+                if align_query and t_query is not None:
+                    q_hat = proj.project_query(q).float()
+                    tq = F.normalize(t_query.float(), dim=-1)
+                    feat = feat + squared_l2(q_hat, tq)
+                    cos_q = float((q_hat * tq).sum(-1).mean())
+
+                loss = (lambda_ce * ce + feat_weight * feat) / self.grad_accum
+
+            loss.backward()
+            total_loss += loss.item() * self.grad_accum
+            total_ce += ce.item()
+            total_feat += float(feat)
+            total_cos_q += cos_q
+            total_cos_c += cos_c
+
+            if step % self.grad_accum == 0 or step == steps_per_epoch:
+                torch.nn.utils.clip_grad_norm_(backbone.parameters(), self.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            if step % self.log_every == 0:
+                lr = scheduler.get_last_lr()[0]
+                logger.info(
+                    f"[Epoch {epoch:02d} | Step {step:05d}/{steps_per_epoch}] "
+                    f"feat_loss={loss.item() * self.grad_accum:.4f}  ce={ce.item():.4f}  "
+                    f"feat={float(feat):.4f}  cos_q={cos_q:.4f}  cos_c={cos_c:.4f}  lr={lr:.2e}"
+                )
+
+        result = {
+            "avg_loss": total_loss / steps_per_epoch,
+            "avg_contrastive_loss": total_ce / steps_per_epoch,
+            "avg_feat": total_feat / steps_per_epoch,
+            "avg_cos_query": total_cos_q / steps_per_epoch,
+            "avg_cos_candidate": total_cos_c / steps_per_epoch,
+        }
+        logger.info(
+            f"[Epoch {epoch:02d}] feat_avg_loss={result['avg_loss']:.4f}  "
+            f"ce={result['avg_contrastive_loss']:.4f}  feat={result['avg_feat']:.4f}  "
+            f"cos_q={result['avg_cos_query']:.4f}  cos_c={result['avg_cos_candidate']:.4f}"
         )
         return result
 
