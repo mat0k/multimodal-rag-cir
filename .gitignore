@@ -212,6 +212,9 @@ __marimo__/
 models/
 !models/.gitkeep
 
+# Reference clone of external repos (read-only, not part of our code)
+magiclens_reference/
+
 # Training checkpoints from your own runs
 checkpoints/
 !checkpoints/.gitkeep
