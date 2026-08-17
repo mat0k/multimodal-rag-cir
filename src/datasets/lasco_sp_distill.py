@@ -36,6 +36,7 @@ class LaSCoSPDistill(Dataset):
         image_transform: Optional[Callable] = None,
         caption_transform: Optional[Callable] = None,
         max_length_tokenizer: int = 77,
+        teacher_query_emb_path: Optional[str] = None,
     ):
         super().__init__()
         self.name = "LaSCoSPDistill"
@@ -59,6 +60,25 @@ class LaSCoSPDistill(Dataset):
                 f"teacher emb rows {self.teacher_emb.shape[0]} != subset {len(self.subset)}"
             )
 
+        # Cached teacher QUERY embeddings — feature-based KD only (EmbedDistill
+        # matches query and document embeddings separately). None for SP/RKD/CRD,
+        # which need the candidate side only, so their configs are unaffected.
+        self.teacher_query_emb: Optional[torch.Tensor] = None
+        if teacher_query_emb_path is not None:
+            q = torch.load(teacher_query_emb_path, map_location="cpu").float()
+            q = torch.nn.functional.normalize(q, dim=-1)
+            if q.shape[0] != len(self.subset):
+                raise ValueError(
+                    f"teacher query emb rows {q.shape[0]} != subset {len(self.subset)}"
+                )
+            if q.shape[-1] != self.teacher_emb.shape[-1]:
+                raise ValueError(
+                    f"teacher query dim {q.shape[-1]} != teacher cand dim "
+                    f"{self.teacher_emb.shape[-1]} — query and candidate embeddings must "
+                    f"live in the SAME space or query-candidate cosine is meaningless."
+                )
+            self.teacher_query_emb = q
+
         # Cluster ids for batch sampling (None -> random floor ablation).
         self.cluster_ids: Optional[list[int]] = None
         if cluster_labels_path is not None:
@@ -76,7 +96,7 @@ class LaSCoSPDistill(Dataset):
         target_rel = t["target-image"][1]
         target_image = self._load_image(target_rel)
         input_ids, attn = self._tokenize(t["query-text"])
-        return {
+        item = {
             "ref_image": ref_image,
             "target_image": target_image,
             "input_ids": input_ids,
@@ -85,6 +105,9 @@ class LaSCoSPDistill(Dataset):
             "target_id": target_rel,
             "qid": int(t["qid"]),
         }
+        if self.teacher_query_emb is not None:
+            item["teacher_query_emb"] = self.teacher_query_emb[index]  # [d_teacher]
+        return item
 
     def _tokenize(self, text: str):
         if self.caption_transform is None:
@@ -110,6 +133,7 @@ def build_lasco_sp_distill_dataset(
     image_transform: Optional[Callable] = None,
     caption_transform: Optional[Callable] = None,
     max_length_tokenizer: int = 77,
+    teacher_query_emb_path: Optional[str] = None,
 ) -> LaSCoSPDistill:
     return LaSCoSPDistill(
         subset_path=subset_path,
@@ -119,4 +143,5 @@ def build_lasco_sp_distill_dataset(
         image_transform=image_transform,
         caption_transform=caption_transform,
         max_length_tokenizer=max_length_tokenizer,
+        teacher_query_emb_path=teacher_query_emb_path,
     )
