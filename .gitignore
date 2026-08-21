@@ -240,6 +240,7 @@ data/fashioniq
 LOCAL_AGENT_REFERENCE.md
 phase-2.0.local.md
 RUN_SETTINGS.local.md
+MAGICLENS_HANDOFF.md
 
 /lamRA_hierachy.txt
 
@@ -254,3 +255,5 @@ cir-project-weekly-progress.pptx.pdf
 /graphify-out
 /.claude
 CLAUDE.md
+MAGICLENS_HANDOFF.md
+docs/magiclens_port.md
