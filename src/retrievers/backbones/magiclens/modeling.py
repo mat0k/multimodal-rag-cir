@@ -13,17 +13,112 @@ empty-string instruction — this matches the official eval protocol
 not a plain CLIP image embedding.
 """
 
-from typing import List, Optional, Union
+from typing import Any, List, Mapping, Optional, Union
 
+import numpy as np
 import open_clip
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 from src.retrievers.backbones.magiclens.layers import (
     MLAttenTokenPoolingLayer,
     MLStackedTransformer,
 )
+
+# Verified identical to Scenic's clip_model.IMAGE_MEAN/IMAGE_STD (max diff 2.4e-07).
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+# CLIP's context length. The trainer and every eval dataset builder hardcode 77;
+# assert rather than assume, since a mismatch would silently mis-pad.
+CONTEXT_LENGTH = 77
+
+
+class MagicLensImagePreprocess:
+    """Reproduces the official MagicLens evaluation preprocessing.
+
+    Faithful to `magiclens_reference/data_utils.py::process_img` followed by
+    `model.py::_preprocess_images`. Two details are unusual and load-bearing:
+
+    1. Pixels are scaled by the image's OWN maximum value, not by 255. A frame
+       whose brightest pixel is 200 is therefore brightened, not merely rescaled.
+    2. The image is resized straight to a square, so the aspect ratio is
+       squashed rather than cropped. The reference's `largest_square_crop` is a
+       no-op in the eval path precisely because `process_img` already produced a
+       square, so replicating the crop here would NOT match the official
+       pipeline.
+
+    Deviating from either would still produce plausible-looking embeddings while
+    silently degrading retrieval, so both are kept exactly as upstream.
+    """
+
+    def __init__(self, size: int = 224, is_train: bool = False):
+        self.size = size
+        self.is_train = is_train
+        self._mean = torch.tensor(CLIP_MEAN).view(3, 1, 1)
+        self._std = torch.tensor(CLIP_STD).view(3, 1, 1)
+        self._random_crop = None
+        if is_train:
+            # Mild augmentation mirroring VISTA's train transform, applied before
+            # the max-scaling so the scaling still reflects the pixels the model sees.
+            from torchvision.transforms import InterpolationMode, RandomResizedCrop
+
+            self._random_crop = RandomResizedCrop(
+                size, scale=(0.9, 1.0), interpolation=InterpolationMode.BILINEAR, antialias=True
+            )
+
+    def __call__(self, image: Image.Image) -> torch.Tensor:
+        image = image.convert("RGB")
+        if self._random_crop is not None:
+            image = self._random_crop(image)
+
+        array = torch.from_numpy(np.asarray(image).copy()).float()      # [H, W, 3]
+        array = array / (array.max() + 1e-12)                           # per-image max
+        tensor = array.permute(2, 0, 1).unsqueeze(0)                    # [1, 3, H, W]
+        if tensor.shape[-2:] != (self.size, self.size):
+            tensor = F.interpolate(
+                tensor, size=(self.size, self.size),
+                mode="bilinear", align_corners=False, antialias=True,
+            )
+        return ((tensor[0] - self._mean) / self._std)
+
+
+class MagicLensTokenizer:
+    """Adapts open_clip's tokenizer to the HuggingFace-style call the datasets use.
+
+    The SP dataset and every eval dataset call the tokenizer as
+    `tok(text, padding="max_length", max_length=77, truncation=True,
+    return_tensors="pt")` and then index `["input_ids"]` / `["attention_mask"]`.
+    open_clip instead returns a bare `[B, 77]` tensor and accepts no kwargs.
+    """
+
+    def __init__(self, tokenizer: Any, context_length: int = CONTEXT_LENGTH):
+        self._tokenizer = tokenizer
+        self.context_length = context_length
+        self.model_max_length = context_length
+
+    def __call__(
+        self,
+        text: Union[str, List[str]],
+        max_length: Optional[int] = None,
+        return_tensors: str = "pt",
+        **_: Any,
+    ) -> dict:
+        # padding/truncation are accepted and ignored: open_clip always pads and
+        # truncates to exactly context_length, which is the behaviour callers ask for.
+        if max_length is not None and max_length != self.context_length:
+            raise ValueError(
+                f"MagicLens uses CLIP's fixed context length of {self.context_length}; "
+                f"got max_length={max_length}."
+            )
+        if return_tensors != "pt":
+            raise ValueError("MagicLensTokenizer supports return_tensors='pt' only.")
+
+        input_ids = self._tokenizer([text] if isinstance(text, str) else list(text))
+        # CLIP pads with id 0; every real token (including SOT/EOT) is non-zero.
+        return {"input_ids": input_ids, "attention_mask": (input_ids != 0).long()}
 
 MAGICLENS_CONFIGS = {
     "base": dict(
@@ -67,7 +162,12 @@ class MagicLens(nn.Module):
         # CLIP backbone — architecture only, no pretrained weights (those
         # come from the converted MagicLens checkpoint, not stock CLIP).
         self.clip = open_clip.create_model(cfg["clip_model_name"], pretrained=None)
-        self.tokenizer = open_clip.get_tokenizer(cfg["clip_model_name"])
+        self.tokenizer = MagicLensTokenizer(open_clip.get_tokenizer(cfg["clip_model_name"]))
+
+        # Named to match Visualized_BGE so the trainer and retriever wrappers can
+        # use either backbone without dispatching on type.
+        self.preprocess_train = MagicLensImagePreprocess(cfg["image_resolution"], is_train=True)
+        self.preprocess_val = MagicLensImagePreprocess(cfg["image_resolution"], is_train=False)
 
         self.multimodal_encoder = MLStackedTransformer(
             num_layers=cfg["num_layers"],
@@ -89,7 +189,7 @@ class MagicLens(nn.Module):
 
         # Cached "empty instruction" tokenization for candidate/gallery
         # images (mirrors the official eval scripts' `tokenizer("")`).
-        null_tokens = self.tokenizer([""])
+        null_tokens = self.tokenizer([""])["input_ids"]
         self.register_buffer("_null_text_tokens", null_tokens, persistent=False)
 
     @property
@@ -118,15 +218,28 @@ class MagicLens(nn.Module):
         pooled = pooled[:, 0]
         return self._normalize(pooled)
 
-    def encode_mm(self, images: torch.Tensor, texts: Union[List[str], torch.Tensor]) -> torch.Tensor:
+    def encode_mm(
+        self, images: torch.Tensor, texts: Union[List[str], torch.Tensor, Mapping[str, torch.Tensor]]
+    ) -> torch.Tensor:
         """Query encoder: reference image + instruction text -> [B, hidden_dim].
 
-        NOTE: takes raw strings (tokenized internally with CLIP's own
-        tokenizer) or pre-tokenized ids. This does NOT yet accept VISTA's
-        HF-style {input_ids, attention_mask} dict — the SP dataset/collator
-        will need a per-backbone adapter for that. Flagged, not solved yet.
+        Accepts raw strings, pre-tokenized CLIP ids, or the HF-style
+        ``{"input_ids", "attention_mask"}`` dict that the trainer and the eval
+        code pass, so this matches `Visualized_BGE.encode_mm`'s calling
+        convention.
+
+        ``attention_mask`` is deliberately ignored: CLIP locates the EOT token
+        by ``argmax`` over the ids (EOT is 49407, the largest id in the
+        vocabulary), so padding cannot affect pooling. This is correct, not a
+        shortcut.
         """
-        text_tokens = texts if torch.is_tensor(texts) else self.tokenizer(list(texts)).to(images.device)
+        if isinstance(texts, Mapping):
+            text_tokens = texts["input_ids"]
+        elif torch.is_tensor(texts):
+            text_tokens = texts
+        else:
+            text_tokens = self.tokenizer(list(texts))["input_ids"]
+        text_tokens = text_tokens.to(images.device)
         image_embeds, text_embeds = self._clip_encode(images, text_tokens)
         return self._fuse(image_embeds, text_embeds)
 

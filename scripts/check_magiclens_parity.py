@@ -50,13 +50,32 @@ def cmd_emit(args: argparse.Namespace) -> int:
     """Build fixed inputs. Runs in the main env (needs open_clip's tokenizer)."""
     import open_clip
 
-    rng = np.random.default_rng(args.seed)
-    batch = len(PROMPTS)
-    # NHWC in [0, 1]: the layout and range the reference's preprocessing expects.
-    images = rng.uniform(0.0, 1.0, size=(batch, 224, 224, 3)).astype(np.float32)
-
     tokenizer = open_clip.get_tokenizer("ViT-B-16-quickgelu")
     ids = tokenizer(PROMPTS).numpy().astype(np.int32)
+
+    if args.real_images:
+        # Real photos at native resolution, so the reference's own loader does the
+        # scaling and resizing. This is what exercises the preprocessing path that
+        # synthetic 224x224 inputs leave untested.
+        import glob
+
+        paths = sorted(glob.glob(args.real_images))[: len(PROMPTS)]
+        if len(paths) < len(PROMPTS):
+            print(f"need >= {len(PROMPTS)} images matching {args.real_images}, found {len(paths)}",
+                  file=sys.stderr)
+            return 1
+        np.savez(args.output, image_paths=np.array(paths, dtype=object), ids=ids,
+                 prompts=np.array(PROMPTS, dtype=object))
+        print(f"Wrote {args.output}")
+        from PIL import Image
+        for path in paths:
+            print(f"  {Image.open(path).size}  {path}")
+        print(f"  ids    {ids.shape} {ids.dtype}")
+        return 0
+
+    rng = np.random.default_rng(args.seed)
+    # NHWC in [0, 1]: the layout and range the reference's preprocessing expects.
+    images = rng.uniform(0.0, 1.0, size=(len(PROMPTS), 224, 224, 3)).astype(np.float32)
 
     np.savez(args.output, images=images, ids=ids, prompts=np.array(PROMPTS, dtype=object))
     print(f"Wrote {args.output}")
@@ -82,8 +101,15 @@ def cmd_jax(args: argparse.Namespace) -> int:
     from scenic.projects.baselines.clip import model as clip_model
 
     data = np.load(args.inputs, allow_pickle=True)
-    images = jnp.asarray(data["images"])
     ids = jnp.asarray(data["ids"])
+    if "image_paths" in data:
+        # Load through the reference's own loader, so the /max scaling and the
+        # squashing resize are theirs, not our reimplementation of them.
+        from data_utils import process_img  # from magiclens_reference/
+
+        images = jnp.concatenate([process_img(str(p), 224) for p in data["image_paths"]], axis=0)
+    else:
+        images = jnp.asarray(data["images"])
 
     model = MagicLens(args.model_size)
     params = model.init(
@@ -137,21 +163,35 @@ def cmd_torch(args: argparse.Namespace) -> int:
 
     data = np.load(args.inputs, allow_pickle=True)
     reference = np.load(args.jax)
-    raw_images = data["images"]              # NHWC, [0, 1]
     ids = data["ids"]
     ref_embeds = reference["embeds"]
     ref_preprocessed = reference["preprocessed"]  # NHWC, normalised by the reference
 
     ok = True
 
-    # (a) Does our normalisation match the reference's preprocessing?
-    ours_preprocessed = (raw_images - CLIP_MEAN) / CLIP_STD
-    delta = np.abs(ours_preprocessed - ref_preprocessed).max()
-    print(f"preprocessing: max|ours - reference| = {delta:.3e}", end="  ")
-    if delta < 1e-4:
-        print("(CLIP constants match)")
+    # (a) Does our preprocessing reproduce the reference's?
+    if "image_paths" in data:
+        # Real photos: this exercises the /max scaling and the squashing resize,
+        # which synthetic 224x224 inputs leave as no-ops.
+        from PIL import Image
+
+        from src.retrievers.backbones.magiclens.modeling import MagicLensImagePreprocess
+
+        preprocess = MagicLensImagePreprocess(224, is_train=False)
+        ours_preprocessed = torch.stack(
+            [preprocess(Image.open(str(p))) for p in data["image_paths"]]
+        ).numpy().transpose(0, 2, 3, 1)  # -> NHWC, to match the reference
+        label = "preprocessing (real images, full pipeline)"
     else:
-        print("(MISMATCH -- our normalisation constants differ from the reference)")
+        ours_preprocessed = (data["images"] - CLIP_MEAN) / CLIP_STD
+        label = "preprocessing (normalisation constants only)"
+
+    delta = np.abs(ours_preprocessed - ref_preprocessed).max()
+    print(f"{label}: max|ours - reference| = {delta:.3e}", end="  ")
+    if delta < 1e-3:
+        print("(match)")
+    else:
+        print("(MISMATCH -- our preprocessing differs from the reference)")
         ok = False
 
     # (b) Model parity, on the reference's own pixels so only the model differs.
@@ -187,6 +227,9 @@ def main() -> int:
     p_emit = sub.add_parser("emit", help="write fixed inputs (main env)")
     p_emit.add_argument("--output", type=Path, required=True)
     p_emit.add_argument("--seed", type=int, default=0)
+    p_emit.add_argument("--real-images", type=str, default=None,
+                        help="Glob of real images to use at native resolution instead of "
+                             "synthetic 224x224 noise, exercising the full preprocessing path.")
     p_emit.set_defaults(func=cmd_emit)
 
     p_jax = sub.add_parser("jax", help="reference forward pass (jax+scenic env)")

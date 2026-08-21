@@ -53,15 +53,36 @@ def _zscore(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_backbone(cfg: dict) -> Visualized_BGE:
+def _model_type(cfg: dict) -> str:
+    """Backbone selector. Defaults to 'vista', so configs without it are unchanged."""
+    return str(cfg["model"].get("type", "vista")).strip().lower()
+
+
+def _build_backbone(cfg: dict):
     m = cfg["model"]
-    return Visualized_BGE(
-        model_name_bge=m["model_name_or_path"],
-        model_weight=m["checkpoint_path"],
-        temperature=cfg["training"].get("temperature", 0.02),
-        negatives_cross_device=False,
-        from_pretrained=m.get("from_pretrained"),
-    )
+    model_type = _model_type(cfg)
+
+    if model_type == "vista":
+        return Visualized_BGE(
+            model_name_bge=m["model_name_or_path"],
+            model_weight=m["checkpoint_path"],
+            temperature=cfg["training"].get("temperature", 0.02),
+            negatives_cross_device=False,
+            from_pretrained=m.get("from_pretrained"),
+        )
+
+    if model_type == "magiclens":
+        # Imported lazily: MagicLens pulls in open_clip, which the VISTA path
+        # does not require.
+        from src.retrievers.backbones.magiclens.modeling import MagicLens
+
+        backbone = MagicLens(model_size=m.get("model_size", "base"))
+        backbone.load_state_dict(
+            torch.load(m["checkpoint_path"], map_location="cpu"), strict=True
+        )
+        return backbone
+
+    raise ValueError(f"Unsupported model.type '{model_type}'. Supported: vista, magiclens.")
 
 
 def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader:
@@ -269,7 +290,7 @@ def _build_optimizer_and_scheduler(
     return optimizer, scheduler
 
 
-def _run_eval(backbone: Visualized_BGE, cfg: dict) -> dict[str, float]:
+def _run_eval(backbone, cfg: dict) -> dict[str, float]:
     """Evaluate on FashionIQ val and CIRR val using the existing eval pipeline."""
     from src.evaluation.fashioniq_eval import evaluate_fashioniq
     from src.evaluation.cirr_eval import evaluate_cirr
@@ -278,7 +299,12 @@ def _run_eval(backbone: Visualized_BGE, cfg: dict) -> dict[str, float]:
 
     ec = cfg["evaluation"]
     backbone.eval()
-    retriever = VistaBGERetriever(backbone)
+    if _model_type(cfg) == "magiclens":
+        from src.retrievers.magiclens_retriever import MagicLensRetriever
+
+        retriever = MagicLensRetriever(backbone)
+    else:
+        retriever = VistaBGERetriever(backbone)
     metrics: dict[str, float] = {}
 
     if "fashioniq" in ec["datasets"]:
@@ -1407,12 +1433,15 @@ class Trainer:
         )
         return result
 
-    def _freeze_layers(self, backbone: Visualized_BGE) -> dict:
+    def _freeze_layers(self, backbone) -> dict:
         """
         Freeze layers according to config freeze.strategy.
-          - full            : train all parameters (v1 behaviour)
-          - top_layers_only : freeze vision encoder + bottom BGE layers,
-                              train top BGE layers + visual_proj only
+          - full                : train all parameters (v1 behaviour)
+          - top_layers_only     : [VISTA] freeze vision encoder + bottom BGE layers,
+                                  train top BGE layers + visual_proj only
+          - magiclens_head_only : [MagicLens] freeze the CLIP towers, train the
+                                  fusion head (multimodal_encoder + pooler), ~10% of
+                                  params -- the analogue of top_layers_only's ~11%
         """
         freeze_cfg = self.cfg.get("freeze", {"strategy": "full"})
         strategy = freeze_cfg.get("strategy", "full")
@@ -1452,8 +1481,37 @@ class Trainer:
                 "model_visual  (EVA02-CLIP-B-16, full vision encoder)",
                 "bge_pooler",
             ]
+        elif strategy == "magiclens_head_only":
+            for param in backbone.parameters():
+                param.requires_grad = False
+
+            # Fusion head: the multimodal encoder and the attention pooler.
+            for module in (backbone.multimodal_encoder, backbone.contrastive_multimodal_pooler):
+                for param in module.parameters():
+                    param.requires_grad = True
+
+            trainable_modules = ["multimodal_encoder", "contrastive_multimodal_pooler"]
+            frozen_modules = ["clip.visual  (CLIP vision tower)", "clip  (CLIP text tower)"]
+
+            # Optionally also adapt the upper CLIP text blocks, closer in spirit to
+            # top_layers_only's top-N BGE layers. Defaults to 0 (off).
+            n_text = int(freeze_cfg.get("clip_train_top_n_text_layers", 0))
+            if n_text > 0:
+                blocks = backbone.clip.transformer.resblocks
+                for block in blocks[len(blocks) - n_text:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+                trainable_modules.append(
+                    f"clip.transformer.resblocks[{len(blocks) - n_text}:{len(blocks)}]"
+                )
+                frozen_modules[1] = f"clip  (CLIP text tower, bottom {len(blocks) - n_text} blocks)"
+
+            trainable_params = sum(p.numel() for p in backbone.parameters() if p.requires_grad)
         else:
-            raise ValueError(f"Unknown freeze strategy: {strategy!r}. Use 'full' or 'top_layers_only'.")
+            raise ValueError(
+                f"Unknown freeze strategy: {strategy!r}. "
+                "Use 'full', 'top_layers_only' (VISTA), or 'magiclens_head_only' (MagicLens)."
+            )
 
         info = {
             "strategy": strategy,
@@ -1464,7 +1522,11 @@ class Trainer:
             "trainable_modules": trainable_modules,
             "frozen_modules": frozen_modules,
             "loss_function": "CrossEntropyLoss (InfoNCE with in-batch negatives)",
-            "loss_defined_in": "src/retrievers/backbones/vista/modeling.py :: compute_loss()",
+            "loss_defined_in": (
+                "src/training/trainer.py :: in-epoch CE anchor"
+                if _model_type(self.cfg) == "magiclens"
+                else "src/retrievers/backbones/vista/modeling.py :: compute_loss()"
+            ),
             "temperature": self.cfg["training"].get("temperature", 0.02),
         }
 
@@ -1474,11 +1536,12 @@ class Trainer:
         return info
 
     def _save_checkpoint(
-        self, backbone: Visualized_BGE, epoch: int, tag: str
+        self, backbone, epoch: int, tag: str
     ) -> None:
         ckpt_dir = self.output_dir / "checkpoints"
         ckpt_dir.mkdir(exist_ok=True)
-        path = ckpt_dir / f"vista_{tag}.pth"
+        # Prefix follows the backbone; 'vista' default keeps existing filenames.
+        path = ckpt_dir / f"{_model_type(self.cfg)}_{tag}.pth"
         torch.save(backbone.state_dict(), path)
         logger.info(f"Checkpoint saved → {path}")
 
