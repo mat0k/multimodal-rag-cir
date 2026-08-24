@@ -256,3 +256,6 @@ cir-project-weekly-progress.pptx.pdf
 /.claude
 CLAUDE.md
 MAGICLENS_HANDOFF.md
+
+# standalone MagicLens PyTorch repo (staged here, published separately)
+magiclens-pytorch/

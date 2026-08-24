@@ -62,6 +62,18 @@ MODELS: list[dict] = [
         "short": "distilled_bge_vl_sp_w3000_ep7",
         "checkpoint": "results/bge_vl/distill_bge_vl_sp_w3000/checkpoints/vista_epoch07.pth",
     },
+    {
+        # Zero-shot, straight from the converted weights: this is the row the
+        # MagicLens paper reports (Table 13, MagicLens-B / CLIP-B, 166M params),
+        # so submitting it tests whether the port reproduces the published
+        # test-split numbers -- R@1 27.0, R@5 58.0, R@10 70.9, R@50 91.1,
+        # subset R@1 66.7, R@2 83.9, R@3 92.4.
+        "name": "MagicLens-B zero-shot (ported)",
+        "short": "magiclens_base_zeroshot",
+        "checkpoint": "models/magiclens/magic_lens_clip_base.pt",
+        "type": "magiclens",
+        "model_size": "base",
+    },
 ]
 
 BGE_MODEL_NAME = "BAAI/bge-base-en-v1.5"
@@ -89,14 +101,27 @@ def generate_for_model(entry: dict, args, device: str) -> dict:
 
     print(f"\n{'='*70}\n{entry['name']}\n  {entry['checkpoint']}\n{'='*70}", flush=True)
 
-    backbone = Visualized_BGE(
-        model_name_bge=BGE_MODEL_NAME,
-        model_weight=str(ckpt),
-        negatives_cross_device=False,
-    )
+    model_type = str(entry.get("type", "vista")).strip().lower()
+    if model_type == "magiclens":
+        # Imported lazily: MagicLens needs open_clip, which the VISTA path does not.
+        from src.retrievers.magiclens_retriever import MagicLensRetriever
+
+        model = MagicLensRetriever.from_pretrained(
+            entry.get("model_size", "base"), checkpoint_path=str(ckpt)
+        )
+        backbone = model.backbone
+    elif model_type == "vista":
+        backbone = Visualized_BGE(
+            model_name_bge=BGE_MODEL_NAME,
+            model_weight=str(ckpt),
+            negatives_cross_device=False,
+        )
+        model = VistaBGERetriever(backbone)
+    else:
+        raise ValueError(f"Unsupported model type {model_type!r}; use 'vista' or 'magiclens'.")
+
     backbone.eval()
     backbone.to(device)
-    model = VistaBGERetriever(backbone)
 
     # ---- test1 gallery + queries (dataset already supports split='test1') ----
     index_ds = build_cirr_dataset(
@@ -185,7 +210,16 @@ def main(args) -> None:
     if device == "cpu":
         print("WARNING: CUDA unavailable — this will be very slow.", flush=True)
 
-    results = [generate_for_model(e, args, device) for e in MODELS]
+    selected = MODELS
+    if args.only:
+        wanted = {s.strip() for s in args.only.split(",")}
+        selected = [e for e in MODELS if e["short"] in wanted]
+        missing = wanted - {e["short"] for e in selected}
+        if missing:
+            raise SystemExit(f"unknown model short name(s): {sorted(missing)}; "
+                             f"available: {sorted(e['short'] for e in MODELS)}")
+
+    results = [generate_for_model(e, args, device) for e in selected]
 
     out_dir = PROJECT_ROOT / args.out_dir
     manifest = {
@@ -201,7 +235,20 @@ def main(args) -> None:
         },
         "models": results,
     }
-    json.dump(manifest, open(out_dir / "submission_manifest.json", "w"), indent=2)
+
+    # Merge into any existing manifest rather than clobbering it, so a partial
+    # re-run (--only) does not erase the record of previously generated models.
+    manifest_path = out_dir / "submission_manifest.json"
+    if manifest_path.exists():
+        try:
+            previous = json.load(open(manifest_path))
+            kept = [m for m in previous.get("models", [])
+                    if m.get("short") not in {r.get("short") for r in results}]
+            manifest["models"] = kept + results
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"  WARNING: could not merge existing manifest ({exc}); writing fresh.")
+
+    json.dump(manifest, open(manifest_path, "w"), indent=2)
 
     print(f"\n{'='*70}\nSUBMIT THESE {2*len(results)} FILES to https://cirr.cecs.anu.edu.au/\n{'='*70}")
     for r in results:
@@ -222,4 +269,7 @@ if __name__ == "__main__":
     p.add_argument("--top-k", type=int, default=50, help="server wants top-50 for 'recall'")
     p.add_argument("--subset-top-k", type=int, default=3, help="server wants top-3 for 'recall_subset'")
     p.add_argument("--out-dir", default="results/cirr_test_submissions")
+    p.add_argument("--only", default=None,
+                   help="Comma-separated model short names to generate (default: all). "
+                        "Use this to avoid regenerating models already submitted.")
     main(p.parse_args())

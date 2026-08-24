@@ -222,9 +222,65 @@ unmodified:
 - `src/retrievers/magiclens_retriever.py` wraps the backbone as a `TwoEncoderVLM`.
   `.text` raises: MagicLens has no text-only tower, so only
   `query_embedding_mode='vista_mm'` (native multimodal) is supported.
+- `MagicLens.forward()` reproduces `Visualized_BGE.forward`'s contrastive step —
+  same similarity, temperature scaling, and target construction — returning an
+  object with `.loss`. This is required by the contrastive training path, which
+  calls the backbone directly rather than computing the loss in the trainer.
+  Reimplementing the objective differently here would leave the two contrastive
+  baselines silently non-comparable, which is the whole point of running one.
 
 The SP loss is Gram-based, so MagicLens' 512-d embedding trains against the 4096-d
 BGE-VL teacher cache with no projection layer.
+
+## Zero-shot benchmark (end-to-end validation)
+
+Run on the repo's own evaluation pipeline (`val_split`, `vista_mm`, fusion `sum`), i.e.
+the same protocol as the VISTA baselines, so the comparison is apples-to-apples.
+
+| Model | FIQ avg R@10 | CIRR summary |
+|---|---|---|
+| VISTA zero-shot | 24.00 | 48.61 |
+| VISTA contrastive fine-tuned | 25.71 | 53.97 |
+| VISTA + SP distillation (best, clean teacher) | 27.46 | 56.46 |
+| **MagicLens-B zero-shot (this port)** | **25.90** | **64.11** |
+
+Full: FIQ avg R@5/10/50 = 19.36 / 25.90 / 48.41; CIRR global R@1/5/10 = 29.99 / 60.27 /
+73.02, subset R@1 = 67.95, summary = 64.11.
+
+Two observations:
+
+1. **CIRR is a decisive win.** Zero-shot MagicLens (64.11) exceeds the *fully SP-distilled*
+   VISTA (56.46) by 7.65 points, and zero-shot VISTA by 15.5.
+2. **Fashion-IQ is much weaker in relative terms.** 25.90 only matches contrastively
+   fine-tuned VISTA (25.71) and sits *below* distilled VISTA (27.46). The asymmetry is
+   consistent with the training data: MagicLens' 36.7M web-mined triplets are open-domain,
+   which matches CIRR's domain but not Fashion-IQ's narrow fashion-attribute domain.
+
+## Reproduction against the published numbers
+
+Confirmed against Zhang et al. (ICML'24), Table 12 (Fashion-IQ) and Table 13 (CIRR), row
+**MagicLens-B / CLIP-B, 166M params** — matching our checkpoint's 166,433,025 exactly.
+Full data in `results/magiclens/paper_reproduction/`.
+
+| Benchmark | Metric | Paper | This port |
+|---|---|---|---|
+| Fashion-IQ (val) | overall R@10 | 26.3 | 25.90 |
+| Fashion-IQ (val) | overall R@50 | 47.4 | 48.41 |
+| CIRR (test1) | R@1 | 27.0 | 29.52 |
+| CIRR (test1) | R@5 | 58.0 | 59.61 |
+| CIRR (test1) | R@10 | 70.9 | 72.63 |
+| CIRR (test1) | R@50 | 91.1 | 91.74 |
+| CIRR (test1) | R_subset@1 | 66.7 | 67.35 |
+
+CIRR was scored by the official server (<https://cirr.cecs.anu.edu.au/>), so our harness is
+out of that loop entirely. Mean absolute difference: 0.77 on Fashion-IQ (8 metrics),
+1.11 on CIRR (7 metrics).
+
+All seven CIRR deltas are positive — systematic rather than scatter, and worth stating
+plainly. Since the model is provably identical to the original, the difference has to come
+from the evaluation pipeline: MagicLens' released code contains no CIRR evaluation at all
+(only FIQ, CIRCO, DTIN), so the paper's CIRR numbers came from an internal pipeline that
+cannot be inspected or matched. We have not isolated the cause and do not claim to have.
 
 ## Reproducing
 
@@ -241,6 +297,29 @@ the upstream README. Verify the download — a truncated file still unpickles fa
 enough to look plausible. The `base` checkpoint is ~635 MB (665,747,853 bytes);
 an early truncated copy at 82 MB failed only at `pickle.load()`.
 
+## Standalone repository
+
+The port is also packaged as a self-contained repo, staged at `magiclens-pytorch/`
+(gitignored here, published separately as `mat0k/magiclens-pytorch`).
+
+Files were **copied, never moved** — this repo keeps and uses its own versions.
+Copied: `layers.py`, `modeling.py`, `convert_magiclens_weights.py`,
+`check_magiclens_parity.py`, and this document as the basis for its README.
+Not copied: `magiclens_retriever.py`, configs, jobs — all depend on this repo's
+`TwoEncoderVLM` and are thesis glue.
+
+Two deliberate divergences in the copies: relative imports, and `auto_device` defaults to
+**False** there (a library must not seize the GPU on construction — the opposite of what
+this repo's trainer needs, and the source of the CPU-training incident above).
+
+Licensing is permissive and settled: upstream releases code under **Apache 2.0** and "all
+other materials", including checkpoints, under **CC-BY 4.0** — so redistributing both the
+port and the converted weights is allowed with attribution.
+
+Weights (`models/magiclens/magic_lens_clip_base.pt`, 635 MB, plain `torch.save`
+state_dict) go to HuggingFace Hub rather than Drive: versioned, fetchable in code, and
+free at this size.
+
 ## Status / open items
 
 - [x] Architecture ported
@@ -250,6 +329,6 @@ an early truncated copy at 82 MB failed only at `pickle.load()`.
 - [x] Preprocessing parity on real images at native resolution — 7.8e-06
 - [x] Trainer integration (tokenizer adapter, preprocess, retriever wrapper, backbone
       dispatch); VISTA path verified unchanged
-- [ ] Zero-shot Fashion-IQ / CIRR benchmark vs published numbers — **the gate**
+- [x] Zero-shot Fashion-IQ / CIRR benchmark — **gate passed** (see below)
 - [ ] Contrastive baseline, then SP distillation run
 - [ ] `large` variant not yet converted (config exists; mapping should be identical)

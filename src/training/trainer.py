@@ -58,6 +58,19 @@ def _model_type(cfg: dict) -> str:
     return str(cfg["model"].get("type", "vista")).strip().lower()
 
 
+def _loss_location(cfg: dict) -> str:
+    """Where the training loss actually lives, for the freeze_info record.
+
+    Distillation losses are computed in the epoch methods here; contrastive
+    losses come from the backbone's own forward().
+    """
+    if cfg.get("training_mode") == "distillation":
+        return "src/training/trainer.py :: distillation epoch method"
+    if _model_type(cfg) == "magiclens":
+        return "src/retrievers/backbones/magiclens/modeling.py :: MagicLens.forward()"
+    return "src/retrievers/backbones/vista/modeling.py :: compute_loss()"
+
+
 def _build_backbone(cfg: dict):
     m = cfg["model"]
     model_type = _model_type(cfg)
@@ -76,7 +89,10 @@ def _build_backbone(cfg: dict):
         # does not require.
         from src.retrievers.backbones.magiclens.modeling import MagicLens
 
-        backbone = MagicLens(model_size=m.get("model_size", "base"))
+        backbone = MagicLens(
+            model_size=m.get("model_size", "base"),
+            temperature=cfg["training"].get("temperature", 0.02),
+        )
         backbone.load_state_dict(
             torch.load(m["checkpoint_path"], map_location="cpu"), strict=True
         )
@@ -375,6 +391,18 @@ class Trainer:
             )
 
         backbone = _build_backbone(self.cfg)
+
+        # The epoch methods read `backbone.device` and move batches to it; they never
+        # move the backbone itself. A backbone that failed to self-move to CUDA
+        # therefore trains on CPU silently, ~24x slower, with no error. Fail loudly.
+        if torch.cuda.is_available() and backbone.device.type != "cuda":
+            raise RuntimeError(
+                f"CUDA is available but the backbone is on {backbone.device}. Training "
+                "would silently run on CPU. The backbone must move itself to CUDA in its "
+                "constructor (see Visualized_BGE / MagicLens)."
+            )
+        logger.info(f"Backbone device   : {backbone.device}")
+
         freeze_info = self._freeze_layers(backbone)
         save_to_json(freeze_info, self.output_dir / "freeze_info.json")
         backbone.train()
@@ -1522,11 +1550,7 @@ class Trainer:
             "trainable_modules": trainable_modules,
             "frozen_modules": frozen_modules,
             "loss_function": "CrossEntropyLoss (InfoNCE with in-batch negatives)",
-            "loss_defined_in": (
-                "src/training/trainer.py :: in-epoch CE anchor"
-                if _model_type(self.cfg) == "magiclens"
-                else "src/retrievers/backbones/vista/modeling.py :: compute_loss()"
-            ),
+            "loss_defined_in": _loss_location(self.cfg),
             "temperature": self.cfg["training"].get("temperature", 0.02),
         }
 

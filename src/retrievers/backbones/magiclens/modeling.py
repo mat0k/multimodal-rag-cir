@@ -13,6 +13,7 @@ empty-string instruction — this matches the official eval protocol
 not a plain CLIP image embedding.
 """
 
+from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Union
 
 import numpy as np
@@ -142,6 +143,16 @@ MAGICLENS_CONFIGS = {
 }
 
 
+@dataclass
+class MagicLensOutput:
+    """Mirrors `Visualized_BGE`'s EncoderOutput, so the trainer reads `.loss` the same way."""
+
+    loss: Optional[torch.Tensor] = None
+    scores: Optional[torch.Tensor] = None
+    q_reps: Optional[torch.Tensor] = None
+    c_reps: Optional[torch.Tensor] = None
+
+
 class MagicLens(nn.Module):
     """PyTorch MagicLens: CLIP backbone + custom multimodal fusion head.
 
@@ -150,7 +161,7 @@ class MagicLens(nn.Module):
     .hidden_dim, .device.
     """
 
-    def __init__(self, model_size: str = "base"):
+    def __init__(self, model_size: str = "base", temperature: float = 0.02):
         super().__init__()
         if model_size not in MAGICLENS_CONFIGS:
             raise ValueError(f"model_size must be one of {list(MAGICLENS_CONFIGS)}")
@@ -158,6 +169,8 @@ class MagicLens(nn.Module):
         self.model_size = model_size
         self.hidden_dim = cfg["embed_dim"]
         self.image_resolution = cfg["image_resolution"]
+        self.temperature = temperature
+        self.cross_entropy = nn.CrossEntropyLoss(reduction="mean")
 
         # CLIP backbone — architecture only, no pretrained weights (those
         # come from the converted MagicLens checkpoint, not stock CLIP).
@@ -191,6 +204,13 @@ class MagicLens(nn.Module):
         # images (mirrors the official eval scripts' `tokenizer("")`).
         null_tokens = self.tokenizer([""])["input_ids"]
         self.register_buffer("_null_text_tokens", null_tokens, persistent=False)
+
+        # Self-move to GPU, matching Visualized_BGE. The trainer never calls
+        # .to(device) on the backbone -- it reads `backbone.device` and moves the
+        # *batches* there -- so a backbone that stays on CPU silently trains on CPU
+        # at roughly 1/24th the speed instead of failing.
+        if torch.cuda.is_available():
+            self.to(torch.device("cuda"))
 
     @property
     def device(self) -> torch.device:
@@ -250,3 +270,43 @@ class MagicLens(nn.Module):
         text_tokens = self._null_text_tokens.expand(B, -1).to(images.device)
         image_embeds, text_embeds = self._clip_encode(images, text_tokens)
         return self._fuse(image_embeds, text_embeds)
+
+    def compute_similarity(self, q_reps: torch.Tensor, p_reps: torch.Tensor) -> torch.Tensor:
+        if len(p_reps.size()) == 2:
+            return torch.matmul(q_reps, p_reps.transpose(0, 1))
+        return torch.matmul(q_reps, p_reps.transpose(-2, -1))
+
+    def forward(
+        self,
+        mm_it_query=None,
+        image_candidate=None,
+        task_type: Optional[str] = None,
+        **_: Any,
+    ) -> MagicLensOutput:
+        """Contrastive training step, matching `Visualized_BGE.forward`.
+
+        The trainer's contrastive epoch calls the backbone directly and reads
+        `output.loss`, so this reproduces VISTA's InfoNCE formulation exactly
+        (same similarity, same temperature scaling, same target construction) --
+        otherwise the MagicLens contrastive baseline would not be comparable to
+        the VISTA one it is meant to parallel.
+        """
+        if task_type != "edit_image":
+            raise ValueError(
+                f"MagicLens supports task_type='edit_image' only; got {task_type!r}."
+            )
+
+        query_reps = self.encode_mm(mm_it_query[0], mm_it_query[1])
+        candi_reps = self.encode_image(image_candidate)
+
+        if self.training:
+            scores = self.compute_similarity(query_reps, candi_reps) / self.temperature
+            scores = scores.view(query_reps.size(0), -1)
+            target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
+            target = target * (candi_reps.size(0) // query_reps.size(0))
+            loss = self.cross_entropy(scores, target)
+        else:
+            scores = self.compute_similarity(query_reps, candi_reps)
+            loss = None
+
+        return MagicLensOutput(loss=loss, scores=scores, q_reps=query_reps, c_reps=candi_reps)
