@@ -92,6 +92,10 @@ def _build_backbone(cfg: dict):
         backbone = MagicLens(
             model_size=m.get("model_size", "base"),
             temperature=cfg["training"].get("temperature", 0.02),
+            # MagicLens' own recipe adds the reference image (with an empty
+            # instruction) as an extra hard negative. Configurable so the
+            # paper's ablation can be reproduced.
+            use_query_negatives=m.get("use_query_negatives", True),
         )
         backbone.load_state_dict(
             torch.load(m["checkpoint_path"], map_location="cpu"), strict=True

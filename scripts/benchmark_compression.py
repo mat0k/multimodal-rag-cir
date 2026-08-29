@@ -60,6 +60,26 @@ MODELS: list[dict] = [
         "short": "distilled_bge_vl_sp_w3000_ep7",
         "checkpoint": "results/bge_vl/distill_bge_vl_sp_w3000/checkpoints/vista_epoch07.pth",
     },
+    # --- MagicLens arm: the second student, same question ---------------------
+    # Zero-shot vs SP-distilled. Contrastive fine-tuning is deliberately not an arm
+    # here: it never beat zero-shot for MagicLens, so zero-shot IS the baseline.
+    {
+        "name": "MagicLens-B zero-shot (baseline)",
+        "short": "magiclens_base_zeroshot",
+        "checkpoint": "models/magiclens/magic_lens_clip_base.pt",
+        "type": "magiclens",
+        "model_size": "base",
+    },
+    {
+        "name": "MagicLens-B + SP distillation (ours)",
+        "short": "magiclens_sp_ce0.1_ep1",
+        # Epoch 1 is the genuine best (27.52 / 66.18); both SP runs peak there and
+        # decay after. NOT magiclens_best.pth, which selects among trained epochs
+        # only and never compares against the untrained start.
+        "checkpoint": "results/magiclens/distill_magiclens_bge_vl_sp_w3000_ce0.1/checkpoints/magiclens_epoch01.pth",
+        "type": "magiclens",
+        "model_size": "base",
+    },
 ]
 
 BGE_MODEL_NAME = "BAAI/bge-base-en-v1.5"
@@ -87,10 +107,22 @@ def encode_model(entry: dict, args, device: str) -> dict:
         raise FileNotFoundError(f"checkpoint missing: {ckpt}")
     print(f"\n{'='*70}\nENCODING  {entry['name']}\n  {entry['checkpoint']}\n{'='*70}", flush=True)
 
-    backbone = Visualized_BGE(model_name_bge=BGE_MODEL_NAME, model_weight=str(ckpt),
-                              negatives_cross_device=False)
+    model_type = str(entry.get("type", "vista")).strip().lower()
+    if model_type == "magiclens":
+        # Imported lazily: MagicLens needs open_clip, which the VISTA path does not.
+        from src.retrievers.magiclens_retriever import MagicLensRetriever
+
+        model = MagicLensRetriever.from_pretrained(entry.get("model_size", "base"),
+                                                   checkpoint_path=str(ckpt))
+        backbone = model.backbone
+    elif model_type == "vista":
+        backbone = Visualized_BGE(model_name_bge=BGE_MODEL_NAME, model_weight=str(ckpt),
+                                  negatives_cross_device=False)
+        model = VistaBGERetriever(backbone)
+    else:
+        raise ValueError(f"Unsupported model type {model_type!r}; use 'vista' or 'magiclens'.")
+
     backbone.eval(); backbone.to(device)
-    model = VistaBGERetriever(backbone)
     t0 = time.time()
 
     # ---- CIRR val ----
@@ -247,19 +279,26 @@ def render(results: list[dict], env: dict) -> str:
     hdr = "| Setting | Index size | " + " | ".join(names) + " |"
     sep = "|---|---|" + "---|" * len(names)
 
+    # Read the real embedding width off the results rather than assuming 768:
+    # VISTA is 768-d but MagicLens is 512-d, and hardcoding the former silently
+    # misreports every index size and compression ratio for the latter.
+    dim = results[0].get("dim", 768)
+
     def block(title, key, fmt="{:.2f}"):
         L.append(f"\n## {title}\n")
         L.append(hdr); L.append(sep)
         base = results[0]["full"]["_index_mb"]
-        L.append("| **fp32, 768-d (uncompressed)** | " + f"{base:.2f} MB | " +
+        L.append(f"| **fp32, {dim}-d (uncompressed)** | " + f"{base:.2f} MB | " +
                  " | ".join(fmt.format(r["full"][key]) for r in results) + " |")
         for d in TRUNC_DIMS:
-            mb = base * d / 768
-            L.append(f"| PCA {d}-d | {mb:.2f} MB ({768/d:.1f}× smaller) | " +
+            if d >= dim:
+                continue  # not a truncation for this model
+            mb = base * d / dim
+            L.append(f"| PCA {d}-d | {mb:.2f} MB ({dim/d:.1f}× smaller) | " +
                      " | ".join(fmt.format(r["pca"][str(d)][key]) for r in results) + " |")
         for p in PRECISIONS:
             factor = {"fp16": 2, "int8": 4, "binary": 32}[p]
-            L.append(f"| {p}, 768-d | {base/factor:.2f} MB ({factor}× smaller) | " +
+            L.append(f"| {p}, {dim}-d | {base/factor:.2f} MB ({factor}× smaller) | " +
                      " | ".join(fmt.format(r["quant"][p][key]) for r in results) + " |")
 
     block("CIRR val — summary average (R@5 + R_sub@1)/2", "cirr_summary_avg")
@@ -270,7 +309,7 @@ def render(results: list[dict], env: dict) -> str:
     L.append("|---|" + "---|" * len(names))
     for bench, label in (("cirr", "CIRR"), ("fiq", "FashionIQ")):
         L.append(f"| **{label} gallery** | " + " | ".join("" for _ in results) + " |")
-        L.append(f"| effective rank (of 768) | " +
+        L.append(f"| effective rank (of {dim}) | " +
                  " | ".join(str(r["spectrum"][bench]["effective_rank"]) for r in results) + " |")
         L.append(f"| dims for 95% energy | " +
                  " | ".join(str(r["spectrum"][bench]["dims_for_95pct"]) for r in results) + " |")
@@ -279,6 +318,59 @@ def render(results: list[dict], env: dict) -> str:
                      " | ".join(str(r["spectrum"][bench]["energy_at"][str(d)]) for r in results) + " |")
     L.append("\n_Higher effective rank = information spread over more dimensions = more lost "
              "when truncating. This is the explanation for the tables above, not a cost metric._\n")
+
+    # ---- Retention: how much of its OWN score each model keeps under compression.
+    # Absolute scores already say who is better; this isolates whose embedding space
+    # is more robust to being squeezed, independent of the starting accuracy.
+    def _settings():
+        for d in TRUNC_DIMS:
+            if d < dim:
+                yield f"PCA {d}-d", lambda r, d=d: r["pca"][str(d)]
+        for p in PRECISIONS:
+            yield p, lambda r, p=p: r["quant"][p]
+
+    L.append("\n## Retention — % of each model's own uncompressed score\n")
+    L.append("| Setting | " + " | ".join(
+        f"{r['name']} — CIRR | {r['name']} — FIQ" for r in results) + " |")
+    L.append("|---" * (2 * len(results) + 1) + "|")
+    for label, get in _settings():
+        cells = []
+        for r in results:
+            for key in ("cirr_summary_avg", "fiq_avg_R@10"):
+                full = r["full"][key]
+                cells.append(f"{100.0 * get(r)[key] / full:.1f}%" if full else "n/a")
+        L.append(f"| {label} | " + " | ".join(cells) + " |")
+
+    # ---- Iso-accuracy: how far the improved model can be compressed while still
+    # beating the baseline's UNCOMPRESSED score. The strongest efficiency claim
+    # available here -- accuracy gain and index savings at the same time.
+    if len(results) >= 2:
+        base_m, ours = results[0], results[-1]
+        L.append(f"\n## Iso-accuracy — {ours['name']} compressed vs. "
+                 f"{base_m['name']} uncompressed\n")
+        L.append("| Benchmark | Baseline (fp32) | Smallest setting still beating it | Score | Index saving |")
+        L.append("|---|---|---|---|---|")
+        base_mb = results[0]["full"]["_index_mb"]
+        for key, label in (("cirr_summary_avg", "CIRR summary"),
+                           ("fiq_avg_R@10", "FashionIQ avg R@10")):
+            target = base_m["full"][key]
+            best = None  # smallest index that still clears the baseline
+            for lbl, get in _settings():
+                score_ = get(ours)[key]
+                if score_ <= target:
+                    continue
+                if lbl.startswith("PCA"):
+                    d = int(lbl.split()[1].rstrip("-d")); mb = base_mb * d / dim
+                else:
+                    mb = base_mb / {"fp16": 2, "int8": 4, "binary": 32}[lbl]
+                if best is None or mb < best[2]:
+                    best = (lbl, score_, mb)
+            if best:
+                L.append(f"| {label} | {target:.2f} | {best[0]} | {best[1]:.2f} | "
+                         f"{base_mb:.2f} → {best[2]:.2f} MB ({base_mb/best[2]:.1f}× smaller) |")
+            else:
+                L.append(f"| {label} | {target:.2f} | none | — | — |")
+        L.append("")
     return "\n".join(L)
 
 
@@ -288,7 +380,16 @@ def main(args) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     results = []
 
-    for entry in MODELS:
+    selected = MODELS
+    if args.only:
+        wanted = {s.strip() for s in args.only.split(",")}
+        selected = [e for e in MODELS if e["short"] in wanted]
+        missing = wanted - {e["short"] for e in selected}
+        if missing:
+            raise SystemExit(f"unknown model short name(s): {sorted(missing)}; "
+                             f"available: {sorted(e['short'] for e in MODELS)}")
+
+    for entry in selected:
         cache = out_dir / "cache" / f"{entry['short']}.pt"
         if args.sweep_only or cache.exists():
             if not cache.exists():
@@ -304,7 +405,9 @@ def main(args) -> None:
         idx_mb = payload["cirr"]["index"].numel() * 4 / 1024**2
         r["full"] = score(payload, lambda i, p: (_norm(i), _norm(p)))
         r["full"]["_index_mb"] = round(idx_mb, 2)
-        print(f"  fp32/768  CIRR {r['full']['cirr_summary_avg']}  FIQ {r['full']['fiq_avg_R@10']}", flush=True)
+        # Real embedding width, so the report never assumes 768.
+        r["dim"] = int(payload["cirr"]["index"].shape[-1])
+        print(f"  fp32/{r['dim']}  CIRR {r['full']['cirr_summary_avg']}  FIQ {r['full']['fiq_avg_R@10']}", flush=True)
 
         r["pca"] = {}
         for d in TRUNC_DIMS:
@@ -333,19 +436,19 @@ def main(args) -> None:
     (out_dir / "compression_report.md").write_text(report)
 
     # flat CSV for the thesis
-    rows = ["model,setting,index_mb,cirr_summary_avg,cirr_R@1,fiq_avg_R@10,fiq_avg_R@50"]
+    rows = ["model,dim,setting,index_mb,cirr_summary_avg,cirr_R@1,fiq_avg_R@10,fiq_avg_R@50"]
     for r in results:
         base = r["full"]["_index_mb"]
-        rows.append(f"{r['short']},fp32_768,{base:.2f},{r['full']['cirr_summary_avg']},"
+        rows.append(f"{r['short']},{r['dim']},fp32_{r['dim']},{base:.2f},{r['full']['cirr_summary_avg']},"
                     f"{r['full']['cirr_R@1']},{r['full']['fiq_avg_R@10']},{r['full']['fiq_avg_R@50']}")
         for d in TRUNC_DIMS:
             s = r["pca"][str(d)]
-            rows.append(f"{r['short']},pca_{d},{base*d/768:.2f},{s['cirr_summary_avg']},"
+            rows.append(f"{r['short']},{r['dim']},pca_{d},{base*d/r['dim']:.2f},{s['cirr_summary_avg']},"
                         f"{s['cirr_R@1']},{s['fiq_avg_R@10']},{s['fiq_avg_R@50']}")
         for p in PRECISIONS:
             s = r["quant"][p]
             fct = {"fp16": 2, "int8": 4, "binary": 32}[p]
-            rows.append(f"{r['short']},{p}_768,{base/fct:.2f},{s['cirr_summary_avg']},"
+            rows.append(f"{r['short']},{r['dim']},{p}_{r['dim']},{base/fct:.2f},{s['cirr_summary_avg']},"
                         f"{s['cirr_R@1']},{s['fiq_avg_R@10']},{s['fiq_avg_R@50']}")
     (out_dir / "compression_results.csv").write_text("\n".join(rows) + "\n")
 
@@ -361,4 +464,7 @@ if __name__ == "__main__":
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--sweep-only", action="store_true", help="reuse cached embeddings (CPU only)")
     p.add_argument("--out-dir", default="results/compression")
+    p.add_argument("--only", default=None,
+                   help="Comma-separated model short names (default: all). Use this to run "
+                        "one arm pair without recomputing the others.")
     main(p.parse_args())

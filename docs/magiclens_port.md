@@ -320,6 +320,56 @@ Weights (`models/magiclens/magic_lens_clip_base.pt`, 635 MB, plain `torch.save`
 state_dict) go to HuggingFace Hub rather than Drive: versioned, fetchable in code, and
 free at this size.
 
+## Results as a distillation student
+
+Baseline is zero-shot MagicLens-B: Fashion-IQ avg R@10 **25.90**, CIRR summary **64.11**.
+Full data in `results/magiclens/summary/`.
+
+| Method | Setting | Best epoch | Fashion-IQ | Δ | CIRR | Δ |
+|---|---|---|---|---|---|---|
+| Contrastive fine-tuning | batch 32, lr 1e-6 | 5 / 1 | 25.69 | −0.21 | 64.27 | +0.16 |
+| Contrastive fine-tuning | batch 256, lr 3e-6 | 1 | 25.83 | −0.07 | 63.74 | −0.37 |
+| SP distillation | λ_ce 1.0 | 1 | 25.88 | −0.02 | 65.68 | +1.57 |
+| **SP distillation** | **λ_ce 0.1** | **1** | **27.52** | **+1.62** | **66.18** | **+2.07** |
+
+### Contrastive fine-tuning fails, and not because of batch size
+
+Fine-tuning on LaSCo never beat zero-shot. The initial hypothesis was that the negative
+pool was too small: InfoNCE contrasts each query against the other targets *in its batch*,
+MagicLens was pretrained at batch 2048, and we used 32 (gradient accumulation does not
+enlarge the pool). Retesting at batch 256 with a scaled learning rate **refuted this** —
+Fashion-IQ improved only −0.21 → −0.07, still negative, and CIRR got worse.
+
+Caveats: 256 is the hardware ceiling here, not 2048, so a non-linear effect near the
+original scale cannot be excluded; and the retest varied batch size and learning rate
+together (to avoid an optimizer-step confound), leaving ~half as many updates.
+
+### What actually transfers
+
+On *identical data with an identical student*, two independent contrastive configurations
+fail while relation-based SP distillation gains +1.62 / +2.07. **LaSCo's images carry
+useful signal; LaSCo's own labels do not.** What transfers is the teacher's relational
+geometry over those images, not the dataset's query-to-target supervision — the same
+conclusion the VISTA phase reached from a different direction.
+
+### Hyperparameters do not survive a change of student
+
+λ_ce = 1.0 was inherited from VISTA, where contrastive training on LaSCo *helped*, making
+CE a free anchor. For MagicLens it *hurts*, so the same value suppressed the gain outright
+(Fashion-IQ +0.0 at λ=1.0 versus +1.62 at λ=0.1). The diagnostic was that CE fell
+2.75 → 1.65 across epochs while SP stayed flat (0.0007 → 0.0005), with Fashion-IQ
+collapsing over exactly that window.
+
+The anchor was weakened rather than removed: SP constrains only candidate–candidate
+geometry and never sees queries, so CE is the only term aligning a query with its own
+target. λ=0 remains untested. Only {1.0, 0.1} were tried, so the optimum is unmeasured.
+
+Both SP runs **peak at epoch 1** and decay after; λ=0.1 decays more slowly and holds CIRR
+about a point above baseline through epoch 10, but Fashion-IQ still falls below baseline
+from epoch 3. The deliverable is the epoch-1 checkpoint. Note that `magiclens_best.pth` is
+*not* the best model — checkpoint selection compares only trained epochs and never the
+untrained starting point.
+
 ## Status / open items
 
 - [x] Architecture ported

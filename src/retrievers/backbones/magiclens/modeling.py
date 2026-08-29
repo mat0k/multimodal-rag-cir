@@ -161,7 +161,8 @@ class MagicLens(nn.Module):
     .hidden_dim, .device.
     """
 
-    def __init__(self, model_size: str = "base", temperature: float = 0.02):
+    def __init__(self, model_size: str = "base", temperature: float = 0.02,
+                 use_query_negatives: bool = True):
         super().__init__()
         if model_size not in MAGICLENS_CONFIGS:
             raise ValueError(f"model_size must be one of {list(MAGICLENS_CONFIGS)}")
@@ -170,6 +171,9 @@ class MagicLens(nn.Module):
         self.hidden_dim = cfg["embed_dim"]
         self.image_resolution = cfg["image_resolution"]
         self.temperature = temperature
+        # Paper default. Set False only to reproduce the ablation in which the
+        # query-image negative is removed (which degrades every benchmark).
+        self.use_query_negatives = use_query_negatives
         self.cross_entropy = nn.CrossEntropyLoss(reduction="mean")
 
         # CLIP backbone — architecture only, no pretrained weights (those
@@ -283,27 +287,50 @@ class MagicLens(nn.Module):
         task_type: Optional[str] = None,
         **_: Any,
     ) -> MagicLensOutput:
-        """Contrastive training step, matching `Visualized_BGE.forward`.
+        """Contrastive training step, following MagicLens' own recipe.
 
-        The trainer's contrastive epoch calls the backbone directly and reads
-        `output.loss`, so this reproduces VISTA's InfoNCE formulation exactly
-        (same similarity, same temperature scaling, same target construction) --
-        otherwise the MagicLens contrastive baseline would not be comparable to
-        the VISTA one it is meant to parallel.
+        Signature matches `Visualized_BGE.forward` so the trainer can call either
+        backbone identically, but the objective is MagicLens', not VISTA's.
+
+        Direction is one-way, query -> candidates, per the paper: "our model is
+        updated by contrasting the paired query-target against other targets in
+        one training batch". This is *not* CLIP's symmetric image<->text loss;
+        CLIP is a joint embedding trained for retrieval in both directions,
+        whereas composed retrieval only ever ranks candidates given a query.
+
+        When ``use_query_negatives`` is set (the default, and what the paper
+        does), each reference image is *also* encoded with an empty instruction
+        and appended to the candidate pool as an extra hard negative. The paper
+        motivates this directly -- "the query image itself can be a challenging
+        hard negative for the multimodal query" -- and its ablation shows that
+        dropping it degrades every benchmark, with the model learning to "rank
+        the query image itself higher than other images during retrieval".
+        Note ``encode_image`` already encodes with an empty instruction, so it
+        produces exactly the (image_q, "") embedding the paper describes.
         """
         if task_type != "edit_image":
             raise ValueError(
                 f"MagicLens supports task_type='edit_image' only; got {task_type!r}."
             )
 
-        query_reps = self.encode_mm(mm_it_query[0], mm_it_query[1])
+        ref_images, texts = mm_it_query
+        query_reps = self.encode_mm(ref_images, texts)
         candi_reps = self.encode_image(image_candidate)
 
         if self.training:
-            scores = self.compute_similarity(query_reps, candi_reps) / self.temperature
-            scores = scores.view(query_reps.size(0), -1)
-            target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
-            target = target * (candi_reps.size(0) // query_reps.size(0))
+            n_query = query_reps.size(0)
+            # Target index is fixed against the TRUE candidates, before any extra
+            # negatives are appended, so appending cannot shift the positive.
+            target = torch.arange(n_query, device=query_reps.device, dtype=torch.long)
+            target = target * (candi_reps.size(0) // n_query)
+
+            pool = candi_reps
+            if self.use_query_negatives:
+                # The reference images themselves, as additional negatives.
+                pool = torch.cat([candi_reps, self.encode_image(ref_images)], dim=0)
+
+            scores = self.compute_similarity(query_reps, pool) / self.temperature
+            scores = scores.view(n_query, -1)
             loss = self.cross_entropy(scores, target)
         else:
             scores = self.compute_similarity(query_reps, candi_reps)
