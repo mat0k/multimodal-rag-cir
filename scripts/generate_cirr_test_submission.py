@@ -74,6 +74,18 @@ MODELS: list[dict] = [
         "type": "magiclens",
         "model_size": "base",
     },
+    {
+        # Best MagicLens arm: SP relation distillation, lambda_ce=0.1, EPOCH 1
+        # (val 27.52 FIQ / 66.18 CIRR). Epoch 1 is the genuine peak -- every
+        # MagicLens arm peaks there and decays -- and lambda=0.1 is bracketed as
+        # optimal by the sweep (0.3 -> +1.04, 0.1 -> +1.62, 0.03 -> +1.14 FIQ).
+        # NOT magiclens_best.pth, which selects among trained epochs only.
+        "name": "MagicLens-B + SP distillation (ours)",
+        "short": "magiclens_sp_ce0.1_ep1",
+        "checkpoint": "results/magiclens/distill_magiclens_bge_vl_sp_w3000_ce0.1/checkpoints/magiclens_epoch01.pth",
+        "type": "magiclens",
+        "model_size": "base",
+    },
 ]
 
 BGE_MODEL_NAME = "BAAI/bge-base-en-v1.5"
