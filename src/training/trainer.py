@@ -105,11 +105,28 @@ def _build_backbone(cfg: dict):
     raise ValueError(f"Unsupported model.type '{model_type}'. Supported: vista, magiclens.")
 
 
+def _train_image_transform(backbone, cfg: dict) -> VistaImageProcessor:
+    """Image transform for TRAINING batches.
+
+    Defaults to `preprocess_train` (mild RandomResizedCrop), which is VISTA's own
+    recipe. MagicLens' official pipeline never crops -- it resizes straight to a
+    square -- so the crop, plus RandomResizedCrop's aspect-ratio jitter, shifts
+    training inputs away from what the model sees at eval. Measured on Fashion-IQ
+    (aspect ratios 0.32-1.0) the augmented tensor has cosine 0.91 mean / 0.77 worst
+    against the eval tensor. Set `data.train_augmentation: false` to train on the
+    deterministic official preprocessing instead.
+    """
+    if cfg.get("data", {}).get("train_augmentation", True):
+        return VistaImageProcessor(backbone.preprocess_train)
+    logger.info("Train augmentation disabled -> using preprocess_val for training images")
+    return VistaImageProcessor(backbone.preprocess_val)
+
+
 def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader:
     tc = cfg["training"]
     data_cfg = cfg["data"]
 
-    image_transform = VistaImageProcessor(backbone.preprocess_train)
+    image_transform = _train_image_transform(backbone, cfg)
 
     def tokenize(text, **kwargs):
         return backbone.tokenizer(text, **kwargs)
@@ -222,7 +239,7 @@ def _build_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader:
     tc = cfg["training"]
     data_cfg = cfg["data"]
 
-    image_transform = VistaImageProcessor(backbone.preprocess_train)
+    image_transform = _train_image_transform(backbone, cfg)
 
     def tokenize(text, **kwargs):
         return backbone.tokenizer(text, **kwargs)

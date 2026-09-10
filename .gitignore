@@ -259,3 +259,4 @@ MAGICLENS_HANDOFF.md
 
 # standalone MagicLens PyTorch repo (staged here, published separately)
 magiclens-pytorch/
+/paper

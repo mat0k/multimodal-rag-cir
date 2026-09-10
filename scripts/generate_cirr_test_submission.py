@@ -86,6 +86,23 @@ MODELS: list[dict] = [
         "type": "magiclens",
         "model_size": "base",
     },
+    # ---- SUPERVISED setting (trained on CIRR train). Generate with
+    #      --out-dir results/cirr_test_submissions/supervised
+    {
+        # VISTA contrastive fine-tuned on CIRR train only, EPOCH 5 (best val summary 59.09 of 5).
+        "name": "VISTA contrastive, supervised on CIRR (ep5)",
+        "short": "vista_contrastive",
+        "checkpoint": "results/supervised/supervised_vista_cirr_contrastive/checkpoints/vista_epoch05.pth",
+    },
+    {
+        # MagicLens-B contrastive fine-tuned on CIRR train only (head-only, no augmentation),
+        # EPOCH 1 (best val summary 68.56 of 5).
+        "name": "MagicLens-B contrastive, supervised on CIRR (ep1)",
+        "short": "magiclens_contrastive",
+        "checkpoint": "results/magiclens/supervised_magiclens_cirr_contrastive/checkpoints/magiclens_epoch01.pth",
+        "type": "magiclens",
+        "model_size": "base",
+    },
 ]
 
 BGE_MODEL_NAME = "BAAI/bge-base-en-v1.5"
