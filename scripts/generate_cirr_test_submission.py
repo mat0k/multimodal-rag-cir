@@ -53,6 +53,12 @@ from src.retrievers.vista_retriever import VistaBGERetriever  # noqa: E402
 # --------------------------------------------------------------------------
 MODELS: list[dict] = [
     {
+        # Off-the-shelf VISTA, no fine-tuning: the zero-shot row of the main table.
+        "name": "VISTA zero-shot (off-the-shelf)",
+        "short": "vista_zeroshot",
+        "checkpoint": "models/Visualized_BGE/Visualized_base_en_v1.5.pth",
+    },
+    {
         "name": "VISTA fine-tuned (baseline)",
         "short": "baseline_vista_contrastive_v2_ep1",
         "checkpoint": "results/training/vista_lasco_finetune_contrastive_v2/checkpoints/vista_epoch01.pth",

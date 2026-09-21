@@ -19,6 +19,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.datasets.lasco import build_lasco_dataset
 from src.datasets.benchmark_contrastive import build_benchmark_contrastive_dataset
+from src.datasets.benchmark_sp_distill import build_benchmark_sp_distill_dataset
 from src.datasets.lasco_distill import build_lasco_distill_dataset
 from src.datasets.lasco_relation_distill import build_lasco_relation_distill_dataset
 from src.datasets.lasco_sp_distill import build_lasco_sp_distill_dataset
@@ -167,6 +168,44 @@ def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader
             persistent_workers=tc["num_workers"] > 0,
         )
 
+    if "benchmark_sp_distill" in data_cfg:
+        # SUPERVISED (in-domain) counterpart of lasco_sp_distill: same sampler,
+        # collator and losses, FashionIQ/CIRR triplets instead of LaSCo.
+        dc = data_cfg["benchmark_sp_distill"]
+        dataset = build_benchmark_sp_distill_dataset(
+            triplets_path=dc["triplets_path"],
+            teacher_cand_emb_path=dc["teacher_cand_emb_path"],
+            fashioniq_images_dir=dc.get("fashioniq_images_dir"),
+            cirr_images_dir=dc.get("cirr_images_dir"),
+            cluster_labels_path=dc.get("cluster_labels_path"),  # None -> random floor
+            image_transform=image_transform,
+            caption_transform=tokenize,
+            max_length_tokenizer=77,
+            teacher_query_emb_path=dc.get("teacher_query_emb_path"),
+        )
+        sampler = ClusterBatchSampler(
+            cluster_ids=dataset.cluster_ids,
+            batch_size=tc["batch_size"],
+            n_items=len(dataset),
+            shuffle=True,
+            seed=cfg.get("seed", 42),
+            target_ids=dataset.target_ids,
+            unique_per_batch=bool(dc.get("unique_per_batch", False)),
+        )
+        logger.info(
+            f"Benchmark SP distill dataset loaded: {len(dataset):,} pairs | "
+            f"{len(sampler):,} batches of size {tc['batch_size']} "
+            f"({'random floor' if dataset.cluster_ids is None else 'clustered'})"
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=tc["num_workers"],
+            collate_fn=SPCollator(),
+            pin_memory=True,
+            persistent_workers=tc["num_workers"] > 0,
+        )
+
     if "lasco_relation_distill" in data_cfg:
         dc = data_cfg["lasco_relation_distill"]
         dataset = build_lasco_relation_distill_dataset(
@@ -219,7 +258,8 @@ def _build_distill_dataloader(backbone: Visualized_BGE, cfg: dict) -> DataLoader
 
     else:
         raise ValueError(
-            "cfg['data'] must contain 'lasco_distill' or 'benchmark_distill' "
+            "cfg['data'] must contain 'lasco_distill', 'benchmark_distill', "
+            "'lasco_sp_distill', 'benchmark_sp_distill' or 'lasco_relation_distill' "
             f"for distillation mode. Got keys: {list(data_cfg.keys())}"
         )
 
@@ -711,6 +751,11 @@ class Trainer:
                 elif loss_type == "list_mle":
                     all_student = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)  # [B, K+1]
                     all_teacher = torch.cat([teacher_pos.unsqueeze(1), teacher_neg], dim=1)  # [B, K+1]
+                    # Raw cosines give a near-uniform Plackett-Luce likelihood; standardise
+                    # per query when requested (the teacher ordering is scale-free anyway).
+                    if normalize_distill:
+                        all_student = _zscore(all_student)
+                        all_teacher = _zscore(all_teacher)
                     # Sort items by teacher score descending to define target permutation
                     perm = torch.argsort(all_teacher, dim=-1, descending=True)
                     sorted_student = all_student.gather(dim=-1, index=perm)  # [B, K+1]
